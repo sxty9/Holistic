@@ -1,0 +1,181 @@
+package catalogue
+
+import (
+	"errors"
+	"strings"
+	"testing"
+)
+
+func testCat() Catalogue { return New("example.org", Default()) }
+
+// The whole point of the package: one decision, three files, and they agree.
+// Before this, publishing an app meant editing three configurations by hand and
+// discovering you had missed one when a hostname served the wrong document.
+func TestOneAnswerReachesAllThreeConsistently(t *testing.T) {
+	apps := Default()
+	for i := range apps {
+		if apps[i].ID == "gallery" {
+			apps[i].Enabled = true
+		}
+		if apps[i].ID == "calendar" {
+			apps[i].Enabled = false
+		}
+	}
+	c := New("example.org", apps)
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	inWarpgate := map[string]bool{}
+	for _, a := range c.Warpgate() {
+		inWarpgate[a.Name] = true
+	}
+	inSolisuite := map[string]bool{}
+	for _, a := range c.Solisuite() {
+		inSolisuite[a.ID] = true
+		if a.Host != a.ID+".example.org" {
+			t.Errorf("%s: host is %q", a.ID, a.Host)
+		}
+		if a.Origin != "https://"+a.Host {
+			t.Errorf("%s: origin %q does not match host %q", a.ID, a.Origin, a.Host)
+		}
+	}
+
+	if !inWarpgate["gallery"] || !inSolisuite["gallery"] {
+		t.Error("an app that was switched on did not reach every file")
+	}
+	if inWarpgate["calendar"] || inSolisuite["calendar"] {
+		t.Error("an app that was switched off still appears somewhere")
+	}
+}
+
+// RoomSense has its own server. Listing it in Solisuite's app map would point
+// appFor() at a Solisuite document that does not exist — it still needs DNS and
+// ingress, which is exactly why it is easy to get wrong.
+func TestStandaloneAppsGetDNSButNotASolisuiteEntry(t *testing.T) {
+	apps := Default()
+	for i := range apps {
+		if apps[i].ID == "roomsense" {
+			apps[i].Enabled = true
+		}
+	}
+	c := New("example.org", apps)
+
+	var inWarpgate bool
+	for _, a := range c.Warpgate() {
+		if a.Name == "roomsense" {
+			inWarpgate = true
+			if a.Upstream == solisuite {
+				t.Error("roomsense was pointed at Solisuite's port")
+			}
+		}
+	}
+	if !inWarpgate {
+		t.Error("a standalone app got no DNS or ingress, so it is unreachable")
+	}
+	for _, a := range c.Solisuite() {
+		if a.ID == "roomsense" {
+			t.Error("a standalone app was listed as a Solisuite app")
+		}
+	}
+	if _, ok := c.CoreXOrigins(map[string]bool{"roomsense": true})["roomsense"]; ok {
+		t.Error("a standalone app was advertised as one of coreX's own")
+	}
+}
+
+// An origin map listing hostnames that do not resolve is the populated-but-wrong
+// state that shipped once already. Origins are written as each hostname is
+// proven, which also turns the launcher into an honest progress display, since
+// shellApps() already filters to apps that have an origin.
+func TestOriginsAppearOnlyAsHostnamesAreProven(t *testing.T) {
+	c := testCat()
+
+	if got := c.CoreXOrigins(nil); len(got) != 0 {
+		t.Errorf("with nothing proven, %d origin(s) were advertised: %v", len(got), got)
+	}
+
+	half := c.CoreXOrigins(map[string]bool{"launcher": true, "mail": true})
+	if len(half) != 2 {
+		t.Fatalf("expected 2 origins, got %v", half)
+	}
+	if half["mail"] != "https://mail.example.org" {
+		t.Errorf("mail origin is %q", half["mail"])
+	}
+	if _, ok := half["files"]; ok {
+		t.Error("an unproven hostname was advertised")
+	}
+}
+
+// An instance with no launcher has no way in.
+func TestTheWayInCannotBeSwitchedOff(t *testing.T) {
+	apps := Default()
+	for i := range apps {
+		if apps[i].ID == "launcher" {
+			apps[i].Enabled = false
+		}
+	}
+	err := New("example.org", apps).Validate()
+	if err == nil {
+		t.Fatal("an instance with no launcher validated")
+	}
+	if !errors.Is(err, ErrNoLauncher) && !strings.Contains(err.Error(), "cannot be disabled") {
+		t.Errorf("unhelpful refusal: %v", err)
+	}
+}
+
+// Nothing in this repository may contain an instance's domain, so every
+// hostname has to be derived from one passed in — including the failure when
+// none was.
+func TestNoDomainMeansNoHostnames(t *testing.T) {
+	if err := New("", Default()).Validate(); !errors.Is(err, ErrNoDomain) {
+		t.Errorf("a catalogue with no domain validated: %v", err)
+	}
+	if err := New("https://example.org/", Default()).Validate(); err == nil {
+		t.Error("a URL was accepted where a bare domain belongs")
+	}
+}
+
+func TestDuplicateAppsAreRefused(t *testing.T) {
+	apps := append(Default(), App{ID: "mail", Label: "Mail again", Upstream: solisuite, Enabled: true})
+	if err := New("example.org", apps).Validate(); err == nil {
+		t.Error("two apps claiming the same subdomain validated")
+	}
+}
+
+// The defaults are a function so that a caller editing them — which the wizard
+// does, straight from a UI — cannot change them for everybody else.
+func TestDefaultsCannotBeMutatedForEveryoneElse(t *testing.T) {
+	a := Default()
+	a[0].Enabled = false
+	a[0].Label = "vandalised"
+	b := Default()
+	if !b[0].Enabled || b[0].Label == "vandalised" {
+		t.Error("editing one catalogue changed the defaults for the next one")
+	}
+}
+
+// Every enabled app needs its hostname to answer before the instance is done;
+// this is the list the wizard probes.
+func TestHostnamesCoverEveryEnabledApp(t *testing.T) {
+	c := testCat()
+	names := c.Hostnames()
+	if len(names) != len(c.Enabled()) {
+		t.Fatalf("%d hostnames for %d enabled apps", len(names), len(c.Enabled()))
+	}
+	for _, n := range names {
+		if !strings.HasSuffix(n, ".example.org") {
+			t.Errorf("hostname %q is not under the configured domain", n)
+		}
+	}
+}
+
+// The domain is normalised once, here, rather than by each consumer.
+func TestTheDomainIsNormalisedOnce(t *testing.T) {
+	c := New("  EXAMPLE.ORG  ", Default())
+	if c.Domain != "example.org" {
+		t.Errorf("domain is %q", c.Domain)
+	}
+	if c.Hostname("mail") != "mail.example.org" {
+		t.Errorf("hostname is %q", c.Hostname("mail"))
+	}
+}
