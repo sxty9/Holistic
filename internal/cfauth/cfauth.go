@@ -1,0 +1,260 @@
+// Package cfauth builds the Cloudflare credential the setup process needs, and
+// checks the one it is given.
+//
+// The automated path was investigated and declined, and the reason is worth
+// recording so it is re-tested rather than re-argued. Cloudflare does now offer
+// OAuth to third-party applications — self-service registration, PKCE, no
+// client secret to ship — but consent selects an ACCOUNT, not a zone. On an
+// account holding more than one zone, an OAuth grant of dns:edit is therefore
+// WIDER than the hand-scoped token it would replace. The day Cloudflare adds
+// zone-level scoping to the consent screen, this decision changes; until then,
+// manual is not a compromise but the narrower option.
+//
+// What makes manual acceptable is that it does not have to mean transcription.
+// Cloudflare documents template URLs that pre-fill the custom-token form, so
+// the person reviews a form that is already correct and clicks Create. The four
+// permission rows are precisely the step people get wrong and then over-grant
+// out of frustration.
+//
+// Nothing here mints, stores or transmits a token. It builds a link and reads
+// back what the person created.
+package cfauth
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"sort"
+	"strings"
+)
+
+// Permission is one row on Cloudflare's token form.
+//
+// It carries three names for the same thing, because Cloudflare uses three.
+// Key and Type are what the template URL wants. Label is what the dashboard
+// prints, which is what somebody is scanning the screen for. APIName is what
+// /user/tokens/verify hands back, and it is neither of the other two: the form
+// says "Zone → DNS → Edit" and the API says "DNS Write".
+//
+// Matching on the name is a known weak point — Cloudflare documents the group
+// ID as authoritative and the name as cosmetic, and the IDs cannot be known
+// without asking the API for them. The failure mode is chosen deliberately: an
+// unrecognised name reports the permission as missing and prints what the token
+// actually carries, so the operator sees both lists and can tell it is a naming
+// drift rather than a wrong token. A silent pass would be the alternative, and
+// it would be worse.
+type Permission struct {
+	Key     string `json:"key"`
+	Type    string `json:"type"` // read | edit
+	Label   string `json:"-"`
+	APIName string `json:"-"`
+	Why     string `json:"-"`
+}
+
+// Setup is the credential the wizard needs, and the whole of it.
+//
+// Every entry is zone-scoped. Nothing account-scoped appears here, and that is
+// a property worth defending rather than a coincidence: the routing rules this
+// instance writes all point at a Worker, never at a forwarding address, so no
+// verified destination address is ever created and the account-category
+// "Email Routing Addresses" permission is never needed. If a step ever needs a
+// forward action, this list changes shape and the claim that it touches one
+// zone stops being true.
+func Setup() []Permission {
+	return []Permission{
+		{Key: "zone", Type: "read", Label: "Zone → Zone → Read", APIName: "Zone Read",
+			Why: "Confirm the zone is active before publishing into it. A record written to a pending zone answers nobody."},
+		{Key: "dns", Type: "edit", Label: "Zone → DNS → Edit", APIName: "DNS Write",
+			Why: "Publish the app hostnames, and the mail records if mail is set up."},
+		{Key: "zone_settings", Type: "edit", Label: "Zone → Zone Settings → Edit", APIName: "Zone Settings Write",
+			Why: "Turn on Email Routing, which is what makes inbound mail arrive."},
+		{Key: "email_routing_rule", Type: "edit", Label: "Zone → Email Routing Rules → Edit", APIName: "Email Routing Rules Write",
+			Why: "Route the addresses this instance answers to its own inbound Worker."},
+	}
+}
+
+// Runtime is what stays on the machine afterwards: DNS alone, on one zone.
+//
+// Deliberately not the setup token. Once the edge exists, the only reason to
+// hold a credential at all is to reconcile DNS when an app is added or a policy
+// changes; keeping the ability to enable Email Routing or rewrite zone settings
+// past the moment it is needed is a standing risk for no standing benefit.
+func Runtime() []Permission {
+	return []Permission{
+		{Key: "dns", Type: "edit", Label: "Zone → DNS → Edit", APIName: "DNS Write",
+			Why: "Reconcile the hostnames this instance publishes."},
+	}
+}
+
+// TokenURL builds Cloudflare's documented pre-filled token form.
+//
+// zoneID may be empty, in which case the form opens with the zone unselected
+// and the operator picks it. Passing it is much better: it is on the zone's
+// Overview page, it is not a secret, and supplying it is what keeps the token
+// scoped to one zone instead of needing to list them all — which is also what
+// lets the Zone→Read row cover a single zone rather than the account.
+func TokenURL(perms []Permission, zoneID, name string) string {
+	// The API wants a JSON array of {key,type}. Only those two fields; the
+	// labels are ours.
+	slim := make([]map[string]string, 0, len(perms))
+	for _, p := range perms {
+		slim = append(slim, map[string]string{"key": p.Key, "type": p.Type})
+	}
+	b, _ := json.Marshal(slim)
+
+	q := url.Values{}
+	q.Set("permissionGroupKeys", string(b))
+	q.Set("accountId", "*")
+	if zoneID == "" {
+		q.Set("zoneId", "all")
+	} else {
+		q.Set("zoneId", zoneID)
+	}
+	if name != "" {
+		q.Set("name", name)
+	}
+	return "https://dash.cloudflare.com/profile/api-tokens?" + q.Encode()
+}
+
+// ManualSteps are the parts the URL cannot carry, rendered next to the button.
+//
+// The template URL pre-fills the permission rows, the account and zone scope
+// and the name. It does not carry the time-to-live or the client-IP filter,
+// and Cloudflare's own documentation is explicit that the form still has to be
+// completed by hand. Saying which two things are left is the difference between
+// a person finishing and a person wondering what they missed.
+func ManualSteps(zoneID string) []string {
+	steps := []string{
+		"Open the link. The four permission rows are already filled in — check them and change nothing.",
+	}
+	if zoneID == "" {
+		steps = append(steps,
+			"Under Zone Resources, choose Include → Specific zone → your domain. Not 'All zones'.")
+	} else {
+		steps = append(steps,
+			"Under Zone Resources, confirm it names your domain and not 'All zones'.")
+	}
+	steps = append(steps,
+		"Set the expiry to tomorrow's date. This token is for setting up, not for running.",
+		"Continue to summary, create the token, and copy it. Cloudflare shows it once.",
+	)
+	return steps
+}
+
+// --- reading back what was actually created --------------------------------
+
+// Verdict is what a token turned out to be.
+type Verdict struct {
+	Valid bool
+	// Missing are permissions the wizard asked for and did not get. Naming
+	// these is why the read-back exists at all: without it a missing row shows
+	// up three steps later as a 403 on an unrelated-looking call.
+	Missing []Permission
+	// Excess are permissions the token carries that were not asked for.
+	//
+	// No comparable project checks this, and it is cheap. A token wider than
+	// the request is not an error — Cloudflare will happily let somebody paste
+	// an all-zones DNS token, or one that also carries Workers — but the person
+	// should be told, because "I asked for exactly these four rows and yours
+	// has six" is the difference between a paste box and an auditable grant.
+	Excess []string
+	// AllZones is the specific over-grant worth its own field, because it is
+	// the common one and the consequence is concrete: every other domain in
+	// the account is inside the blast radius of this machine.
+	AllZones bool
+}
+
+// tokenBody is the shape of GET /user/tokens/verify plus the token read-back.
+type tokenBody struct {
+	Status   string `json:"status"`
+	Policies []struct {
+		Effect           string `json:"effect"`
+		PermissionGroups []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"permission_groups"`
+		Resources map[string]any `json:"resources"`
+	} `json:"policies"`
+}
+
+// Judge compares a token's actual permissions against what was asked for.
+//
+// It takes the decoded body rather than making the call, so the comparison is
+// testable without a network and without a credential.
+func Judge(raw []byte, want []Permission) (Verdict, error) {
+	var body tokenBody
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return Verdict{}, fmt.Errorf("could not read Cloudflare's answer: %w", err)
+	}
+	v := Verdict{Valid: strings.EqualFold(body.Status, "active")}
+
+	granted := map[string]bool{}
+	for _, p := range body.Policies {
+		if !strings.EqualFold(p.Effect, "allow") {
+			continue
+		}
+		for _, g := range p.PermissionGroups {
+			granted[normalise(g.Name)] = true
+		}
+		for res := range p.Resources {
+			// "com.cloudflare.api.account.zone.*" is every zone in the
+			// account; a specific zone ends in its id.
+			if strings.HasSuffix(res, ".zone.*") || res == "com.cloudflare.api.account.*" {
+				v.AllZones = true
+			}
+		}
+	}
+
+	asked := map[string]bool{}
+	for _, p := range want {
+		asked[normalise(p.APIName)] = true
+		if !granted[normalise(p.APIName)] {
+			v.Missing = append(v.Missing, p)
+		}
+	}
+	for name := range granted {
+		if !asked[name] {
+			v.Excess = append(v.Excess, name)
+		}
+	}
+	sort.Strings(v.Excess)
+	return v, nil
+}
+
+// normalise reduces Cloudflare's user-facing permission names to something
+// comparable. The form says "Edit" where the API says "Write" for the same
+// group, and the arrows and spacing vary between the dashboard and the API.
+func normalise(s string) string {
+	s = strings.ToLower(s)
+	for _, sep := range []string{"→", "->", ":", "  "} {
+		s = strings.ReplaceAll(s, sep, " ")
+	}
+	s = strings.ReplaceAll(s, " write", " edit")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// Explain turns a verdict into what the operator should read.
+func (v Verdict) Explain() []string {
+	var out []string
+	if !v.Valid {
+		out = append(out, "Cloudflare says this token is not active. Check it was copied whole.")
+	}
+	for _, p := range v.Missing {
+		out = append(out, fmt.Sprintf("Missing: %s — %s", p.Label, p.Why))
+	}
+	if v.AllZones {
+		out = append(out, "This token covers EVERY zone in your account, not just this domain. "+
+			"It will work, and it means every other domain you host is inside this machine's reach. "+
+			"Creating one scoped to a single zone takes the same number of clicks.")
+	}
+	for _, e := range v.Excess {
+		out = append(out, fmt.Sprintf("Carries a permission that was not asked for: %s", e))
+	}
+	return out
+}
+
+// OK reports whether setup can proceed. Excess permissions are reported and do
+// not block: it is the operator's account, and refusing to continue over a
+// grant that is merely wider than necessary would be the wizard overruling the
+// person whose account it is.
+func (v Verdict) OK() bool { return v.Valid && len(v.Missing) == 0 }
