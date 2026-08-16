@@ -1,0 +1,63 @@
+[Unit]
+# The setup process. It exists to stop existing: once the instance is claimed
+# and configured, the same act that writes the claim marker disables this unit.
+# A root-privileged HTTP server bound to a local network is a one-time job, and
+# leaving it enabled "just in case" is how the one-time job becomes a permanent
+# liability.
+Description=Holistic setup
+Documentation=https://github.com/sxty9/Holistic
+After=network-online.target
+Wants=network-online.target
+
+# The guard that makes this a one-time unit. Once @CONF@/claimed exists, this
+# unit is skipped even if something enables it — the fact is on disk, owned by
+# root, and not a flag inside a process that could read it the wrong way.
+ConditionPathExists=!@CONF@/claimed
+
+[Service]
+Type=simple
+ExecStart=@PREFIX@/bin/holistic-setup -port @PORT@ -claim @CONF@/setup.claim -ledger @STATE@/provisioned.json -seal @CONF@/claimed
+
+# Root, and deliberately so. This process writes /etc/corex, /etc/solisuite and
+# /etc/warpgate, installs units and starts services — that is what setting up an
+# instance IS. The mitigation is not to pretend otherwise with a service account
+# that needs a sudo wrapper for every step; it is that the unit is conditional,
+# short-lived, and removes itself.
+User=root
+Group=root
+
+# Binding port 80 needs the capability even as root once NoNewPrivileges is on.
+# Nothing else is granted.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+
+# Not ProtectSystem=strict: this process configures the machine, so /etc is its
+# work. It is narrowed to the directories it has business in rather than opened
+# up wholesale.
+ProtectSystem=full
+ReadWritePaths=@CONF@ @STATE@ /etc/corex /etc/solisuite /etc/warpgate /etc/systemd/system
+
+# The setup process answers on the local network only. This is belt to the
+# code's braces: the listener already binds named interfaces rather than
+# 0.0.0.0, and refuses requests that did not arrive from a private address.
+IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 fe80::/10
+IPAddressDeny=any
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
