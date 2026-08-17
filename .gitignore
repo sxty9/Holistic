@@ -1,2 +1,12 @@
 bin/
+dist/
 *.incoming
+
+# The release signing key never belongs here. It lives in one file, mode 0600,
+# outside the repository. These lines are a second lock on a door that should
+# already be shut: a key committed once is a key that has to be rotated, and
+# rotating it means every installer already in circulation refuses every future
+# release.
+*.key
+*.pem
+!*.pub.pem

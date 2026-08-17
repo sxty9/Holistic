@@ -74,7 +74,7 @@ set -euo pipefail
 # attacker who takes the release bucket is stopped; an attacker who can rewrite
 # THIS FILE is not, because they would replace the key below in the same edit.
 readonly HOLISTIC_PUBKEY='-----BEGIN PUBLIC KEY-----
-REPLACE_ME_WITH_THE_RELEASE_PUBLIC_KEY_SEE_release.sh_keygen
+MCowBQYDK2VwAyEAgc/yZKGZqq+Rg2VJXU0y1BXbjKgbdBk8xE+vfa4UczY=
 -----END PUBLIC KEY-----'
 
 # Base URL of the release artifacts. A variable rather than a literal so that
