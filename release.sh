@@ -98,6 +98,55 @@ PY
 	say "   exactly what a signature is for and exactly why losing it hurts."
 }
 
+# --- reaching the key -------------------------------------------------------
+#
+# The key is 0600 and its directory is 0700, both root-owned, so an ordinary
+# user cannot even stat it. That is the point, and it is also why the build does
+# NOT simply run as root: `go build` under sudo writes a root-owned module and
+# build cache into root's home, and the next ordinary build then fails on
+# permissions in a way that takes an afternoon to understand.
+#
+# So the build runs as whoever invoked it, and exactly one step — the signature
+# — elevates. If the key is readable without elevation (a key kept under the
+# operator's own home, which is a perfectly reasonable choice), nothing
+# elevates at all.
+
+SUDO=''
+
+key_reachable() {
+	if [ -r "$KEY" ]; then
+		SUDO=''
+		return 0
+	fi
+	if command -v sudo >/dev/null && sudo -n test -r "$KEY" 2>/dev/null; then
+		SUDO='sudo -n'
+		return 0
+	fi
+	return 1
+}
+
+# installer_pubkey prints the public key exactly as install.sh will use it.
+#
+# The naive extraction — sed from BEGIN to END — takes the whole first line,
+# which in install.sh reads `readonly HOLISTIC_PUBKEY='-----BEGIN PUBLIC KEY---`,
+# and the whole last line, which ends in a stray quote. openssl then reports
+# "Could not find private key of public key", which is a spectacularly
+# misleading way to say "that is not a PEM file". So the wrapper is trimmed off
+# both ends.
+installer_pubkey() {
+	sed -n '/BEGIN PUBLIC KEY/,/END PUBLIC KEY/p' "$HERE/install.sh" |
+		sed -e 's/.*\(-----BEGIN PUBLIC KEY-----\)/\1/' \
+			-e "s/\(-----END PUBLIC KEY-----\).*/\1/"
+}
+
+sign_manifest() {
+	local in="$1" out="$2"
+	# Written to stdout and redirected rather than passed as -out, so the
+	# signature file belongs to the invoking user and not to root — otherwise
+	# the next build cannot overwrite its own dist/.
+	$SUDO openssl pkeyutl -sign -inkey "$KEY" -rawin -in "$in" >"$out"
+}
+
 # --- build ------------------------------------------------------------------
 
 build_one() {
@@ -139,7 +188,8 @@ build() {
 
 	command -v go >/dev/null || die "go is not installed."
 	command -v openssl >/dev/null || die "openssl is not installed."
-	[ -f "$KEY" ] || die "no signing key at $KEY. Run ./release.sh keygen first."
+	key_reachable || die "no signing key at $KEY, or it cannot be reached.
+       Run ./release.sh keygen first, or set HOLISTIC_RELEASE_KEY."
 
 	step "Building $version"
 	rm -rf "$DIST"
@@ -196,7 +246,7 @@ build() {
 		# buffer. Signing SHA256SUMS rather than the archives keeps the signed
 		# input tiny, which also stays clear of openssl's documented 16MB
 		# one-shot limit.
-		openssl pkeyutl -sign -inkey "$KEY" -rawin -in SHA256SUMS -out SHA256SUMS.sig
+		sign_manifest SHA256SUMS SHA256SUMS.sig
 	)
 	note "SHA256SUMS.sig written"
 
@@ -205,10 +255,10 @@ build() {
 		cd "$DIST"
 		local tmpkey
 		tmpkey="$(mktemp)"
-		# Extract the public key from install.sh — the same bytes the installer
-		# will use, not the ones this script could regenerate. If those two ever
-		# disagree, this is where it must fail, not on somebody's machine.
-		sed -n "/BEGIN PUBLIC KEY/,/END PUBLIC KEY/p" "$HERE/install.sh" >"$tmpkey"
+		# The same bytes the installer will use, not the ones this script could
+		# regenerate. If those two ever disagree, this is where it must fail —
+		# not on somebody else's machine.
+		installer_pubkey >"$tmpkey"
 		openssl pkeyutl -verify -pubin -inkey "$tmpkey" -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig >/dev/null ||
 			die "the signature does not verify against the key in install.sh. Run keygen, or check that install.sh was committed after it."
 		rm -f "$tmpkey"
@@ -223,6 +273,34 @@ build() {
 }
 
 # --- publish ----------------------------------------------------------------
+
+# release_notes tells somebody how to check this release without trusting the
+# installer to do it for them. The commands are the ones that actually work —
+# including the key extraction, which is the part everybody gets wrong.
+release_notes() {
+	cat <<NOTES
+Holistic Homeserver $1
+
+Install:
+
+    curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sudo bash
+
+Check it yourself, if you would rather not take the installer's word for it.
+Download install.sh, SHA256SUMS and SHA256SUMS.sig from this release, then:
+
+    sed -n '/BEGIN PUBLIC KEY/,/END PUBLIC KEY/p' install.sh \\
+      | sed -e 's/.*\\(-----BEGIN PUBLIC KEY-----\\)/\\1/' \\
+            -e 's/\\(-----END PUBLIC KEY-----\\).*/\\1/' > holistic.pub.pem
+
+    openssl pkeyutl -verify -pubin -inkey holistic.pub.pem \\
+        -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig
+
+    sha256sum -c SHA256SUMS
+
+The signature is Ed25519 over SHA256SUMS, and it needs pkeyutl rather than
+dgst: openssl refuses an explicit digest with EdDSA operations.
+NOTES
+}
 
 publish() {
 	local version="${1:-}"
@@ -239,7 +317,7 @@ publish() {
 	gh release create "$version" \
 		--repo "$REPO" \
 		--title "$version" \
-		--notes-file <(printf 'Holistic Homeserver %s\n\nVerify by hand:\n\n    sha256sum -c SHA256SUMS\n    openssl pkeyutl -verify -pubin -inkey <(sed -n "/BEGIN PUBLIC/,/END PUBLIC/p" install.sh) \\\n        -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig\n' "$version") \
+		--notes-file <(release_notes "$version") \
 		"$DIST"/*.tar.gz \
 		"$DIST/SHA256SUMS" \
 		"$DIST/SHA256SUMS.sig" \
