@@ -211,12 +211,26 @@ build() {
 			printf '     %s\n' "$out"
 		done
 
-		# Units and examples. Templated with @PREFIX@ and friends; the installer
-		# substitutes them, so one archive fits any layout.
-		cp "$SRC_ROOT/Holistic/deploy/"*.service "$stage/deploy/" 2>/dev/null || true
-		cp "$SRC_ROOT/coreX/deploy/"*.service "$stage/deploy/" 2>/dev/null || true
-		cp "$SRC_ROOT/Solisuite/deploy/"*.service "$stage/deploy/" 2>/dev/null || true
-		cp "$SRC_ROOT/coreX/deploy/"*.example.json "$stage/deploy/" 2>/dev/null || true
+		# Units and examples, named one by one rather than globbed.
+		#
+		# The first build globbed them, and shipped homebridge-adapter.service
+		# into an archive that deliberately contains no homebridge-adapter
+		# binary — a unit for something that is not there, which is precisely
+		# the kind of thing nobody can explain a year later. A wildcard means
+		# the archive's contents are decided by whatever happens to be in a
+		# directory; a list means they are decided here.
+		local unit
+		for unit in \
+			"Holistic/deploy/holistic-setup.service" \
+			"coreX/deploy/corex-api.service" \
+			"coreX/deploy/corex-routedge.service" \
+			"Solisuite/deploy/solisuite.service" \
+			"coreX/deploy/config.example.json" \
+			"coreX/deploy/routedge.example.json"; do
+			[ -f "$SRC_ROOT/$unit" ] ||
+				die "$SRC_ROOT/$unit is missing, and the release needs it."
+			cp "$SRC_ROOT/$unit" "$stage/deploy/"
+		done
 
 		# The built frontend. Not built here on purpose: `pnpm build` needs a
 		# node toolchain and a lockfile install, and doing that inside a release
