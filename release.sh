@@ -309,7 +309,18 @@ publish() {
 	[ -d "$DIST" ] || die "nothing in $DIST. Run ./release.sh build $version first."
 	[ -f "$DIST/SHA256SUMS.sig" ] || die "$DIST is not signed."
 
+	# A 0.0.x release is marked as a prerelease and GitHub then keeps it out of
+	# "latest". That matters more than it sounds: the installer's default path
+	# is releases/latest/download, so an unfinished build cannot become what a
+	# stranger's `curl | sudo bash` installs simply because it was the most
+	# recent thing pushed.
+	local pre=()
+	case "$version" in
+	v0.0.*) pre=(--prerelease) ;;
+	esac
+
 	step "Publishing $version to $REPO"
+	[ ${#pre[@]} -gt 0 ] && note "marked as a prerelease; it will not become 'latest'"
 	# install.sh is uploaded as an asset too, so that
 	# releases/latest/download/install.sh always serves the installer that
 	# matches the artifacts beside it. The copy on the default branch is what
@@ -317,6 +328,7 @@ publish() {
 	gh release create "$version" \
 		--repo "$REPO" \
 		--title "$version" \
+		${pre[@]+"${pre[@]}"} \
 		--notes-file <(release_notes "$version") \
 		"$DIST"/*.tar.gz \
 		"$DIST/SHA256SUMS" \
