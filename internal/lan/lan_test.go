@@ -17,9 +17,14 @@ func TestOnlyPrivateAddressesCount(t *testing.T) {
 		{"172.16.4.1", true},
 		{"127.0.0.1", true},
 		{"::1", true},
-		{"fd00::1", true},            // unique local
-		{"fe80::1", true},            // link-local
-		{"2001:db8:4701::1", false}, // a real address on a home connection
+		{"fd00::1", true}, // unique local
+		{"fe80::1", true}, // link-local
+		// A globally routable IPv6 address, which is the shape an ISP hands a
+		// home connection and the one a wildcard bind would publish to the
+		// internet. 2001:db8::/32 is reserved for documentation (RFC 3849) —
+		// the development machine's own prefix would work identically here and
+		// has no business in a public repository.
+		{"2001:db8:4701::1", false},
 		{"8.8.8.8", false},
 		{"203.0.113.7", false},
 	} {
@@ -121,7 +126,7 @@ func TestTunnelsAndBridgesAreNotOffered(t *testing.T) {
 		{"docker0", net.FlagUp, "172.17.0.1", false},                   // bridge
 		{"br-abc123", net.FlagUp, "172.18.0.1", false},                 // bridge
 		{"lo", net.FlagUp | net.FlagLoopback, "127.0.0.1", false},      // loopback
-		{"wlp8s0", net.FlagUp, "2001:db8:4701:f100::1", false},        // routable v6
+		{"wlp8s0", net.FlagUp, "2001:db8:4701:f100::1", false},         // routable v6
 		{"wlp8s0", net.FlagUp, "fd00::1", true},                        // unique local v6
 	}
 	for _, tc := range cases {
