@@ -31,6 +31,7 @@ PLATFORMS=(linux/amd64 linux/arm64)
 # grows things nobody can explain later.
 COMPONENTS=(
 	"Holistic:./cmd/holistic-setup:holistic-setup"
+	"Holistic:./cmd/holistic:holistic"
 	"coreX:./cmd/corex-api:corex-api"
 	"coreX:./cmd/corex-routedge:corex-routedge"
 	"coreX:./cmd/corexctl:corexctl"
@@ -163,7 +164,7 @@ build_one() {
 		cd "$dir"
 		CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
 			go build -trimpath \
-			-ldflags "-s -w -X main.version=$version" \
+			-ldflags "-s -w -X main.version=$version -X main.pubkeyB64=$(installer_pubkey | base64 -w0)" \
 			-o "$dest/$out" "$pkg"
 	)
 }
@@ -243,6 +244,11 @@ build() {
        cd $SRC_ROOT/Solisuite/web && pnpm install && pnpm build"
 		fi
 
+		# The version, as a file in the archive. It is the only way to answer
+		# "what is installed here?" on a machine installed from
+		# /latest/download, because "latest" is not a version — it is a
+		# redirect that means something else next week. install.sh copies it
+		# into the state directory and `holistic upgrade` reads it back.
 		printf '%s\n' "$version" >"$stage/VERSION"
 
 		(cd "$DIST/stage-$goos-$goarch" && tar -czf "$DIST/holistic-$goos-$goarch.tar.gz" holistic)

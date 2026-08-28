@@ -426,6 +426,7 @@ install_release() {
 		note "would unpack $ARCHIVE into $PREFIX"
 		note "would install $UNIT_DIR/holistic-setup.service"
 		note "would enable and start holistic-setup.service"
+		note "would record the installed version in $STATE/installed.json"
 		return 0
 	fi
 
@@ -451,6 +452,41 @@ install_release() {
 	systemctl daemon-reload </dev/null
 	systemctl enable --now holistic-setup.service </dev/null >/dev/null
 	note "holistic-setup.service is running"
+
+	record_installed "$dir" "$src"
+}
+
+# record_installed writes down what this machine is now running.
+#
+# Without it, `holistic upgrade` has nothing to compare against and can only
+# ever reinstall — and on a machine installed from /latest/download there is no
+# other way to find out, because "latest" is a redirect, not a version. The
+# archive has carried a VERSION file all along; nothing read it.
+#
+# The checksum is the real identity. A tag can be moved and "latest" means
+# something different next week; the hash of the archive is the only thing that
+# actually says whether two installs are the same software.
+record_installed() {
+	local dir="$1" src="$2" ver sum
+	ver="$(cat "$src/VERSION" 2>/dev/null || printf 'unknown')"
+	sum="$(sha256sum "$dir/$ARCHIVE" </dev/null | cut -d' ' -f1)"
+
+	install -d -m 0700 "$STATE"
+	# To a sibling and renamed, so an interrupted write leaves the previous
+	# record whole rather than truncated. A half-written record reads as no
+	# record at all, which would make the next upgrade reinstall in silence.
+	cat >"$STATE/.installed.json.tmp" <<EOF
+{
+  "version": "$ver",
+  "platform": "$(platform)",
+  "archive": "$ARCHIVE",
+  "sha256": "$sum",
+  "installedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+	chmod 0600 "$STATE/.installed.json.tmp"
+	mv "$STATE/.installed.json.tmp" "$STATE/installed.json"
+	note "$STATE/installed.json  ($ver)"
 }
 
 # --- main -------------------------------------------------------------------
