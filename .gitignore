@@ -10,3 +10,6 @@ dist/
 *.key
 *.pem
 !*.pub.pem
+
+# The setup pages are a Vite project; its tree is not.
+web/node_modules/
