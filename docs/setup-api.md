@@ -172,15 +172,19 @@ what to do:
     "desired":  "\"v=spf1 include:amazonses.com ~all\"",
     "why":      "A domain may carry only one SPF record. A second makes every
                  receiver treat SPF as permerror — worse than none.",
+    "unchanged": "Holistic has not changed anything.",
     "resolution": "…",
     "consequence": "outgoing mail fails SPF. Nothing else depends on it."
   }
 }
 ```
 
-**"Holistic has not changed anything" is on its own line in every conflict.**
-That is the product promise, and a promise stated in a paragraph is a promise
-nobody read.
+**"Holistic has not changed anything" is on its own line in every conflict**,
+and it is its OWN FIELD rather than a string the page carries. That is the
+product promise, and a promise stated in a paragraph is a promise nobody read —
+but one living in a component is worse, because the next redesign can drop it
+without anybody noticing it was load-bearing. The field is required, not
+optional, for the same reason.
 
 There is never a way past a conflict from inside the page. `[Check again]`,
 `[Skip this step]`, `[Copy the instructions]` — and nothing else. The point is

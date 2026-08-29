@@ -28,9 +28,11 @@ export function ConflictReport({
   return (
     <Card pad="lg" style={{ display: 'grid', gap: 'var(--space-5)' }}>
       <Banner tone="warn" title="Something is already here">
-        {/* Its own line, in every conflict. A promise stated inside a
-            paragraph is a promise nobody read. */}
-        <strong>Holistic has not changed anything.</strong>
+        {/* Its own line, in every conflict, and its own field on the wire. The
+            sentence is the product's promise; a copy of it living in this
+            component is one the next redesign can drop without anybody
+            noticing it was load-bearing. */}
+        <strong>{conflict.unchanged}</strong>
       </Banner>
 
       <KeyValue

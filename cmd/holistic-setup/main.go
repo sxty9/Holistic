@@ -260,7 +260,8 @@ func (s *server) state(w http.ResponseWriter, r *http.Request) {
 func (s *server) writeState(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, s.steps.State(s.sealed, len(s.refusedCount())))
+	from := s.refusedCount()
+	writeJSON(w, s.steps.State(s.sealed, len(from), from))
 }
 
 func (s *server) runStep(w http.ResponseWriter, r *http.Request) {

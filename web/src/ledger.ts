@@ -35,7 +35,7 @@ function row(s: Step, state: State, _h: Handlers, act: (s: Step) => React.ReactN
         id: s.id,
         label,
         waitingOn: 'this machine',
-        since: s.since ?? state.readAt,
+        since: s.at || state.readAt,
         lastLooked: state.readAt,
         detail: s.detail,
       };
@@ -49,8 +49,11 @@ function row(s: Step, state: State, _h: Handlers, act: (s: Step) => React.ReactN
         // did not — an unnamed wait is a fact about our own instrumentation and
         // the reader should see which one they are looking at.
         waitingOn: s.waitingOn ?? 'someone this step did not name',
-        since: s.since ?? state.readAt,
-        lastLooked: s.lastLooked ?? state.readAt,
+        // `at` is when the wait began and it does not move on a re-check;
+        // `lastLooked` is what moves, and it is the proof of life in a
+        // component that has no animation.
+        since: s.at || state.readAt,
+        lastLooked: s.lastLooked || state.readAt,
         detail: s.detail,
       };
 

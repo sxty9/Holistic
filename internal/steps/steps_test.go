@@ -150,7 +150,7 @@ func (k *kit) run(id string) Row {
 
 func (k *kit) row(id string) Row {
 	k.t.Helper()
-	for _, r := range k.e.State(false, 0).Steps {
+	for _, r := range k.e.State(false, 0, nil).Steps {
 		if r.ID == id {
 			return r
 		}

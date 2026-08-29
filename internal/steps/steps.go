@@ -182,6 +182,9 @@ type Envelope struct {
 	Steps     []Row      `json:"steps"`
 	Resources []Resource `json:"resources"`
 	Refused   int        `json:"refused"`
+	// RefusedFrom names where the wrong codes came from. The count says
+	// something happened; the addresses are what somebody can act on.
+	RefusedFrom []string `json:"refusedFrom"`
 }
 
 // Step is one row's definition. The functions are unexported because a step is

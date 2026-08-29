@@ -32,13 +32,19 @@ export interface Option { value: string; label: string; detail?: string }
 export interface AppChoice { id: string; label: string; detail?: string; on: boolean }
 export interface Change { path: string; from: string; to: string }
 
-/** The six fields of a conflict, always in this order. */
+/** The conflict, always in this order.
+ *
+ *  `unchanged` carries the sentence "Holistic has not changed anything", as
+ *  data rather than as a string in the page. The promise is the product's, not
+ *  the layout's, and a promise that lives in a component is a promise the next
+ *  redesign can drop without anybody noticing it was load-bearing. */
 export interface Conflict {
   object: string;
   found: string;
   foundNote?: string;
   desired: string;
   why: string;
+  unchanged: string;
   resolution: string;
   consequence?: string;
 }
@@ -52,9 +58,10 @@ export interface Step {
   /** How this was shown to be true. An API returning 200 records that; an
    *  end-to-end observation records the observation and its nonce. */
   proof?: string;
+  /** When this status was reached — and it does not move while the status stays
+   *  the same, so on a wait it is when the waiting began. */
   at?: string;
-  /** Since when it has been waiting, and on whom. Only on a wait. */
-  since?: string;
+  /** Whose clock. Only on a wait, and never absent from one. */
   waitingOn?: string;
   lastLooked?: string;
   /** What it will do, for a step that has not run. */
@@ -83,6 +90,8 @@ export interface State {
   /** Wrong setup codes offered before the right one. Someone who has been
    *  probed should be told, on the first screen. */
   refused: number;
+  /** Where the wrong codes came from. The count says something happened; these
+   *  are what somebody can act on. */
   refusedFrom?: string[];
 }
 

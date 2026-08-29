@@ -133,27 +133,32 @@ func (e *Engine) Domain() string {
 	return e.given.domain
 }
 
-// State is the whole thing. sealed and refused are the server's facts rather
-// than the engine's, so they are passed in rather than guessed at.
-func (e *Engine) State(sealed bool, refused int) Envelope {
+// State is the whole thing. sealed and the refusals are the server's facts
+// rather than the engine's, so they are passed in rather than guessed at.
+//
+// refusedFrom carries the addresses, not just the count. Somebody who has been
+// probed should be told by whom, on the first screen — a number alone tells
+// them something happened and gives them nothing to do about it.
+func (e *Engine) State(sealed bool, refused int, refusedFrom []string) Envelope {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.envelope(sealed, refused)
+	return e.envelope(sealed, refused, refusedFrom)
 }
 
-func (e *Engine) envelope(sealed bool, refused int) Envelope {
+func (e *Engine) envelope(sealed bool, refused int, refusedFrom []string) Envelope {
 	recorded := map[string]ledger.Step{}
 	for _, s := range e.led.Steps() {
 		recorded[s.ID] = s
 	}
 
 	env := Envelope{
-		ReadAt:    e.now().UTC().Format(time.RFC3339),
-		Sealed:    sealed,
-		Domain:    e.given.domain,
-		Refused:   refused,
-		Steps:     make([]Row, 0, len(e.order)),
-		Resources: []Resource{},
+		ReadAt:      e.now().UTC().Format(time.RFC3339),
+		Sealed:      sealed,
+		Domain:      e.given.domain,
+		Refused:     refused,
+		RefusedFrom: refusedFrom,
+		Steps:       make([]Row, 0, len(e.order)),
+		Resources:   []Resource{},
 	}
 	for _, st := range e.order {
 		rec := recorded[st.ID]
@@ -175,8 +180,14 @@ func (e *Engine) envelope(sealed bool, refused int) Envelope {
 		}
 		if row.Status == ledger.WaitingOnThem {
 			row.WaitingOn = st.WaitingOn
+			// The in-memory map is this process's own record and is the more
+			// precise of the two. The ledger's is what survives a restart —
+			// without the fallback, a wait that outlives the daemon comes back
+			// with no last-looked at all, which reads as nothing watching it.
 			if t, ok := e.lastLook[st.ID]; ok {
 				row.LastLooked = t.UTC().Format(time.RFC3339)
+			} else {
+				row.LastLooked = rec.LookedAt
 			}
 		}
 		if row.Status == ledger.Conflict {
