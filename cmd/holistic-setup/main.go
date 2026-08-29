@@ -20,9 +20,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -35,6 +37,7 @@ import (
 	"github.com/sxty9/Holistic/internal/lan"
 	"github.com/sxty9/Holistic/internal/ledger"
 	"github.com/sxty9/Holistic/internal/session"
+	"github.com/sxty9/Holistic/internal/steps"
 )
 
 // SealPath marks an instance as claimed. It is root-owned and the setup process
@@ -66,6 +69,7 @@ func main() {
 type server struct {
 	guard    *claim.Guard
 	led      *ledger.Ledger
+	steps    *steps.Engine
 	sessions *session.Store
 	sealed   bool
 	sealAt   string
@@ -76,6 +80,15 @@ type server struct {
 }
 
 func newServer(claimAt, ledgerAt, sealAt string) (*server, error) {
+	return newServerWith(claimAt, ledgerAt, sealAt,
+		steps.DefaultPaths(), steps.LocalMachine(), steps.LiveFetch(30*time.Second))
+}
+
+// newServerWith is the same server pointed somewhere else. It exists so the
+// tests can hand the engine a t.TempDir() and a Machine that records instead of
+// acting — nothing in the test suite may start, stop or restart anything on the
+// machine running it, and that is only true if there is a way to say so.
+func newServerWith(claimAt, ledgerAt, sealAt string, p steps.Paths, m steps.Machine, f steps.Fetch) (*server, error) {
 	s := &server{sessions: session.NewStore(), sealAt: sealAt, claimAt: claimAt}
 
 	_, sealErr := os.Stat(sealAt)
@@ -107,6 +120,11 @@ func newServer(claimAt, ledgerAt, sealAt string) (*server, error) {
 	if s.sealed {
 		return s, nil
 	}
+
+	// Built after the seal check and never on a sealed instance. The engine
+	// reads the machine as it is constructed, and a sealed instance is one
+	// whose setup surface is supposed to be gone rather than merely idle.
+	s.steps = steps.New(led, p, m, f)
 
 	g, err := claim.Load(claimAt)
 	if err != nil {
@@ -141,6 +159,16 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /{$}", s.gate)
 	mux.HandleFunc("POST /claim/{$}", s.redeem)
 	mux.Handle("GET /api/state/{$}", s.sessions.Require(http.HandlerFunc(s.state)))
+
+	// The three action routes carry no trailing slash, which anchors them just
+	// as {$} does: a pattern that does not end in "/" is not a subtree and
+	// matches that path and nothing else. The trailing slash is what would need
+	// anchoring, and these must not have one — ServeMux answers a missing
+	// trailing slash with a redirect, and a redirected POST is a POST that
+	// arrives somewhere with its body gone.
+	mux.Handle("POST /api/step/{id}/run", s.sessions.Require(http.HandlerFunc(s.runStep)))
+	mux.Handle("POST /api/step/{id}/skip", s.sessions.Require(http.HandlerFunc(s.skipStep)))
+	mux.Handle("POST /api/answer/{id}", s.sessions.Require(http.HandlerFunc(s.answer)))
 	return lan.OnlyLocal(mux)
 }
 
@@ -222,13 +250,77 @@ func (s *server) refusedCount() []string {
 	return append([]string(nil), s.refused...)
 }
 
+// state is the whole thing, and it is the answer to every route below too. A
+// page that gets the same envelope back from every call never has to merge two
+// representations of the same thing, and never has to guess which one is newer.
 func (s *server) state(w http.ResponseWriter, r *http.Request) {
+	s.writeState(w)
+}
+
+func (s *server) writeState(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, map[string]any{
-		"steps":       s.led.Steps(),
-		"unconfirmed": s.led.Unconfirmed(),
-	})
+	writeJSON(w, s.steps.State(s.sealed, len(s.refusedCount())))
+}
+
+func (s *server) runStep(w http.ResponseWriter, r *http.Request) {
+	// A step that fails, conflicts or is still waiting is a 200 carrying an
+	// envelope that says so: those are outcomes, and the row is where an
+	// outcome lives. Only a request that is wrong — an id that is not a step,
+	// a body that is not what was asked for — is a 4xx, because that is a
+	// mistake by the caller rather than a fact about the machine.
+	if err := s.steps.Run(r.PathValue("id")); err != nil {
+		s.stepError(w, err)
+		return
+	}
+	s.writeState(w)
+}
+
+func (s *server) skipStep(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body); err != nil {
+		http.Error(w, "unreadable body", http.StatusBadRequest)
+		return
+	}
+	if err := s.steps.Skip(r.PathValue("id"), body.Reason); err != nil {
+		s.stepError(w, err)
+		return
+	}
+	s.writeState(w)
+}
+
+func (s *server) answer(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Value json.RawMessage `json:"value"`
+	}
+	// Bounded: this is an unauthenticated-by-design surface on a LAN, and the
+	// body arrives before anything has decided it is reasonable.
+	if err := json.NewDecoder(io.LimitReader(r.Body, 256<<10)).Decode(&body); err != nil {
+		http.Error(w, "unreadable body", http.StatusBadRequest)
+		return
+	}
+	if err := s.steps.Answer(r.PathValue("id"), body.Value); err != nil {
+		s.stepError(w, err)
+		return
+	}
+	// The envelope, and nothing else — in particular not the value that was
+	// just submitted. A `secret` need is submitted and never returned, and the
+	// only way to be sure of that is for no handler on this surface to have a
+	// path that echoes what it was given.
+	s.writeState(w)
+}
+
+func (s *server) stepError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, steps.ErrUnknownStep):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, steps.ErrNoReason), errors.Is(err, steps.ErrBadAnswer), errors.Is(err, steps.ErrNotAsked):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func (s *server) status(w http.ResponseWriter, r *http.Request) {
