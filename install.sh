@@ -282,6 +282,149 @@ download_release() {
 	note "$ARCHIVE checksum: ok"
 }
 
+# --- the three directories this installer wants -----------------------------
+
+# On the machine this was written on, all three were already taken.
+#
+# /etc/holistic was 0700 holistic:holistic and held the running landscape's
+# secret store — jwt-secret, mail-inbound-secret, ses.env, release.key, a token
+# per service. /var/lib/holistic held that service's state. /opt/holistic held
+# its virtualenv, owned by a third account again.
+#
+# `install -d -m 0750 -o root -g root "$CONF"` does not create what is missing.
+# On a directory that already exists it TAKES IT, and every service reading a
+# secret out of it loses the ability to traverse its own configuration
+# directory. The installer would have printed "ok" and gone on to publish a
+# hostname.
+#
+# That is the failure this whole project exists to prevent, committed by its own
+# installer, on the operator's live machine, at the one moment they are least
+# able to see it.
+#
+# So this installer creates a directory, or adopts an empty one, and otherwise
+# refuses and says what it found. It never takes one over.
+#
+# The marker is what tells the two apart on the second run. Without it every
+# upgrade would refuse, because by then the directories are legitimately full.
+MARKER='.holistic-owns-this'
+
+OCCUPIED=''
+
+# survey_dir answers one question and changes nothing: whose is this?
+#
+# Surveying and creating are separate on purpose. The first version did both in
+# one pass, so a machine where /opt was free and /etc was taken had /opt created
+# and was then told "Holistic has not changed anything" — which was a lie
+# printed by the very function whose job is to not change anything.
+survey_dir() { # <path> -> free | ours | empty | occupied | unreadable | notadir
+	local path="$1" contents
+	if [ ! -e "$path" ]; then
+		printf 'free'
+	elif [ ! -d "$path" ]; then
+		printf 'notadir'
+	elif [ -e "$path/$MARKER" ]; then
+		printf 'ours'
+	elif ! contents="$(ls -A "$path" 2>/dev/null)"; then
+		# Unreadable is NOT empty, and the difference is the whole check. Run
+		# without root against this machine's own /etc/holistic — 0700 and
+		# owned by a service account, holding that service's secrets — a
+		# survey that swallowed the error reported "empty, adopt it". The
+		# operator running --dry-run to see what would happen would have been
+		# told the directory was free.
+		printf 'unreadable'
+	elif [ -z "$contents" ]; then
+		printf 'empty'
+	else
+		printf 'occupied'
+	fi
+}
+
+mark_dir() {
+	printf '%s\n' \
+		"This directory belongs to the Holistic installer." \
+		"Claimed $(date -u +%Y-%m-%dT%H:%M:%SZ). Remove this file and the installer" \
+		"will refuse to touch the directory again rather than take it over." \
+		>"$1/$MARKER"
+	chmod 0644 "$1/$MARKER"
+}
+
+take_dir() { # <path> <mode> — only ever called after the survey said yes
+	local path="$1" mode="$2" verdict
+	verdict="$(survey_dir "$path")"
+	install -d -m "$mode" -o root -g root "$path"
+	[ "$verdict" = ours ] || mark_dir "$path"
+}
+
+# report_occupied prints what is in the way and stops. It quotes rather than
+# summarises, because the operator has to recognise their own system in it.
+report_occupied() {
+	local path owner mode n
+	step "Something else is already here"
+	say ""
+	say "   Holistic has not changed anything."
+	say ""
+	printf '%s' "$OCCUPIED" | while IFS= read -r path; do
+		[ -n "$path" ] || continue
+		owner="$(stat -c '%U:%G' "$path" 2>/dev/null || printf '?')"
+		mode="$(stat -c '%A' "$path" 2>/dev/null || printf '?')"
+		say "   $path"
+		say "     $mode $owner, and not empty:"
+		ls -A "$path" 2>/dev/null | head -8 | sed 's/^/       /'
+		n="$(ls -A "$path" 2>/dev/null | wc -l)"
+		[ "$n" -gt 8 ] && say "       ... and $((n - 8)) more"
+		say ""
+	done
+	say "   Installing would have taken these over — changed their owner to root"
+	say "   and written into them. Whatever is using them now would have lost"
+	say "   access to its own files, and this installer would have reported"
+	say "   success and gone on to publish a hostname."
+	say ""
+	say "   Move or remove what is there yourself, then run this again. If a"
+	say "   directory really is Holistic's already and you want this installer"
+	say "   to manage it, say so by hand:"
+	say ""
+	say "       sudo touch <directory>/$MARKER"
+	say ""
+	say "   Nothing was downloaded and nothing was written."
+	exit 1
+}
+
+# check_paths surveys all three, refuses on any collision, and only then
+# creates. Nothing is written until every path has been cleared.
+check_paths() {
+	step "Checking the directories"
+	OCCUPIED=''
+	local path mode purpose verdict
+	for spec in "$PREFIX:0755:binaries" \
+		"$CONF:0750:configuration and the setup code" \
+		"$STATE:0700:the ledger and the installed-version record"; do
+		path="${spec%%:*}"
+		mode="${spec#*:}"
+		purpose="${mode#*:}"
+		mode="${mode%%:*}"
+		verdict="$(survey_dir "$path")"
+		case "$verdict" in
+		notadir) die "$path exists and is not a directory ($purpose)." ;;
+		unreadable)
+			die "$path exists and cannot be read as $(id -un). Re-run with sudo:
+   until this check can see inside it, it cannot tell an empty directory from
+   one holding somebody else's secrets, and it will not guess."
+			;;
+		occupied) OCCUPIED="$OCCUPIED$path
+" ;;
+		*) note "$path — $verdict, $purpose" ;;
+		esac
+	done
+	[ -n "$OCCUPIED" ] && report_occupied
+
+	[ "$DRY" -eq 1 ] && return 0
+
+	for spec in "$PREFIX:0755" "$CONF:0750" "$STATE:0700"; do
+		take_dir "${spec%%:*}" "${spec##*:}"
+	done
+	return 0
+}
+
 # --- the setup code ---------------------------------------------------------
 
 mint_code() {
@@ -293,7 +436,9 @@ mint_code() {
 }
 
 write_code() {
-	install -d -m 0750 -o root -g root "$CONF"
+	# The directory is claim_dir's business, not this function's — creating it
+	# here as well is how the two would drift apart, and this is the copy that
+	# used to take the directory over.
 	# install(1) creates the file with its final mode. Between an open and a
 	# later chmod there is a window, and a secret is what gets read during it.
 	printf '%s\n' "$1" | install -m 0640 -o root -g root /dev/stdin "$CONF/setup.claim"
@@ -431,7 +576,6 @@ install_release() {
 	fi
 
 	install -d -m 0755 "$PREFIX/bin"
-	install -d -m 0700 "$STATE"
 	tar -xzf "$dir/$ARCHIVE" -C "$dir" </dev/null
 
 	local src="$dir/holistic"
@@ -471,7 +615,6 @@ record_installed() {
 	ver="$(cat "$src/VERSION" 2>/dev/null || printf 'unknown')"
 	sum="$(sha256sum "$dir/$ARCHIVE" </dev/null | cut -d' ' -f1)"
 
-	install -d -m 0700 "$STATE"
 	# To a sibling and renamed, so an interrupted write leaves the previous
 	# record whole rather than truncated. A half-written record reads as no
 	# record at all, which would make the next upgrade reinstall in silence.
@@ -542,6 +685,7 @@ main() {
 
 	if [ "$mode" = code ]; then
 		require_root
+		check_paths
 		[ -f "$CONF/claimed" ] &&
 			die "this instance is already claimed. Re-opening setup is a separate, deliberate act."
 		local fresh
@@ -579,6 +723,7 @@ main() {
 	fi
 
 	[ "$DRY" -eq 0 ] && require_root
+	check_paths
 
 	local plat ver dir
 	plat="$(platform)"
