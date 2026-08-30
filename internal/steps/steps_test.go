@@ -126,6 +126,12 @@ func (r *recorder) EnableNow(unit string) error {
 	return nil
 }
 
+func (r *recorder) StopSoon(unit string) error {
+	r.note("stop-soon " + unit)
+	r.active[unit] = false
+	return r.fail["stop-soon "+unit]
+}
+
 func (r *recorder) Disable(unit string) error {
 	r.note("disable " + unit)
 	r.active[unit] = false
@@ -1698,4 +1704,92 @@ func readTree2(t *testing.T, path string) map[string]any {
 		t.Fatal(err)
 	}
 	return tree
+}
+
+// The seal is run BY the unit it closes. `systemctl disable --now` killed the
+// process mid-call, systemctl never returned, and the step reported
+// "signal: terminated" for work that had already succeeded — seen live on
+// 2026-08-30, where the instance was sealed, the code destroyed and the unit
+// disabled and stopped, and the ledger said failed.
+//
+// So the two halves are two calls: disable, which stops nothing and therefore
+// returns, and a stop that is not waited for.
+func TestClosingSetupDoesNotWaitForItsOwnDeath(t *testing.T) {
+	k := newKit(t)
+	writeClaimFile(t, k)
+	k.drive()
+	k.standIn("cert-wait", "nonce-probe")
+	k.mustPass("corex-restart-2")
+	for _, st := range k.e.order {
+		if st.ID != "seal" {
+			k.standIn(st.ID)
+		}
+	}
+	k.m.calls = nil
+	k.answer("seal", true)
+	row := k.run("seal")
+
+	if row.Status != ledger.Passed {
+		t.Fatalf("the seal reported %s: %s", row.Status, row.Detail)
+	}
+	var disabled, stopped int
+	for i, c := range k.m.calls {
+		switch c {
+		case "disable " + k.p.SetupUnit:
+			disabled = i + 1
+		case "stop-soon " + k.p.SetupUnit:
+			stopped = i + 1
+		}
+	}
+	if disabled == 0 {
+		t.Errorf("the setup unit was not disabled, so it returns at the next boot. Calls: %v", k.m.calls)
+	}
+	if stopped == 0 {
+		t.Errorf("the setup unit was never asked to stop, so the listener stays up. Calls: %v", k.m.calls)
+	}
+	if disabled > 0 && stopped > 0 && stopped < disabled {
+		t.Errorf("the stop was asked for before the disable; the process can die before it is disabled "+
+			"and come back at the next boot. Calls: %v", k.m.calls)
+	}
+}
+
+// A stop that systemd refuses leaves the listener up until the next reboot, and
+// the code is already destroyed — so nothing can be redeemed against it. That
+// is a seal that held, not a failure, and reporting it as a failure is what
+// sent an operator looking for a problem that was not there.
+func TestASealWhoseStopIsRefusedStillCounts(t *testing.T) {
+	k := newKit(t)
+	writeClaimFile(t, k)
+	k.drive()
+	k.standIn("cert-wait", "nonce-probe")
+	k.mustPass("corex-restart-2")
+	for _, st := range k.e.order {
+		if st.ID != "seal" {
+			k.standIn(st.ID)
+		}
+	}
+	k.m.fail["stop-soon "+k.p.SetupUnit] = errors.New("job queue is full")
+	k.answer("seal", true)
+	row := k.run("seal")
+
+	if row.Status != ledger.Passed {
+		t.Fatalf("a seal that wrote its file, destroyed the code and disabled the unit was reported as %s: %s",
+			row.Status, row.Detail)
+	}
+	if !strings.Contains(row.Detail, "still up") {
+		t.Errorf("the row does not say the listener is still running: %q", row.Detail)
+	}
+	if _, err := os.Stat(k.p.Claim); !os.IsNotExist(err) {
+		t.Error("the setup code survived a seal that reported success")
+	}
+}
+
+func writeClaimFile(t *testing.T, k *kit) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(k.p.Claim), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(k.p.Claim, []byte("a-code\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
 }

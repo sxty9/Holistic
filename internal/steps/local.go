@@ -1315,18 +1315,47 @@ func stepSeal() Step {
 			// The seal first. If anything after it fails, the instance is
 			// claimed and the listener is still up — recoverable. The other
 			// order leaves a machine with no code, no seal and no way in.
+			// The directory too. install.sh makes it, but a seal that fails
+			// because a directory is missing is the worst failure this step
+			// has: it leaves the listener up with the code still beside it,
+			// for a reason that has nothing to do with setup.
+			if err := os.MkdirAll(dirOf(e.paths.Seal), 0o755); err != nil {
+				return failed("the seal could not be written: " + err.Error())
+			}
 			if err := os.WriteFile(e.paths.Seal, []byte(e.now().UTC().Format(time.RFC3339)+"\n"), 0o644); err != nil {
 				return failed("the seal could not be written: " + err.Error())
 			}
 			if err := os.Remove(e.paths.Claim); err != nil && !os.IsNotExist(err) {
 				return failed("this instance is sealed, but the setup code could not be destroyed: " + err.Error())
 			}
+			// Disable, which stops nothing and therefore returns. Stopping is
+			// a separate call further down, because THIS process is the unit:
+			// `systemctl disable --now` killed it mid-call, systemctl never
+			// returned, and the step reported "signal: terminated" for work
+			// that had already succeeded. Seen live on 2026-08-30 — the
+			// instance was sealed, the code was gone, the unit was disabled and
+			// stopped, and the ledger said failed.
 			if err := e.machine.Disable(e.paths.SetupUnit); err != nil {
 				return failed("this instance is sealed and its code is gone, but the setup service is still " +
 					"enabled and will come back on the next boot: " + err.Error())
 			}
-			return passed("setup is closed",
-				e.paths.Seal+" written, "+e.paths.Claim+" destroyed, "+e.paths.SetupUnit+" disabled")
+			// Written before the stop is asked for, so the answer survives the
+			// process that is about to be killed. A row on disk is the record;
+			// the HTTP response is a courtesy.
+			row := passed("setup is closed",
+				e.paths.Seal+" written, "+e.paths.Claim+" destroyed, "+e.paths.SetupUnit+
+					" disabled, and its stop requested without waiting — this process is that unit, "+
+					"so waiting for the stop would mean waiting for its own death.")
+			if err := e.machine.StopSoon(e.paths.SetupUnit); err != nil {
+				// Disabled but still running. It is gone at the next boot and
+				// the code is already destroyed, so nothing can be redeemed
+				// against it — say so rather than failing a seal that held.
+				return passed("setup is closed, but the listener is still up until the next reboot",
+					e.paths.Seal+" written, "+e.paths.Claim+" destroyed, "+e.paths.SetupUnit+
+						" disabled. It could not be asked to stop: "+err.Error()+
+						" — nothing can be redeemed against it, because the code is gone.")
+			}
+			return row
 		},
 	}
 }

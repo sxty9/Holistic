@@ -27,10 +27,22 @@ type Machine interface {
 	// running but not enabled is an instance that is on the internet until the
 	// next power cut.
 	EnableNow(unit string) error
-	// Disable stops a unit and keeps it from coming back at the next boot.
-	// Both halves: a setup listener that was stopped but not disabled is a
-	// listener that returns the first time the machine loses power.
+	// Disable keeps a unit from coming back at the next boot. It does NOT stop
+	// it — see StopSoon, and the reason they are two calls.
 	Disable(unit string) error
+	// StopSoon asks systemd to stop a unit and returns without waiting.
+	//
+	// It is separate from Disable because of the one unit that stops itself.
+	// `systemctl disable --now holistic-setup.service` is run BY
+	// holistic-setup.service: the --now kills the process mid-call, systemctl
+	// never returns, and the step reports "signal: terminated" — a failure
+	// message for work that had already succeeded. Seen live on 2026-08-30:
+	// the instance was sealed, the code was gone and the unit was disabled and
+	// stopped, and the ledger said failed.
+	//
+	// So: disable, which returns because it stops nothing; write the result;
+	// then ask for the stop and do not wait for an answer that cannot come.
+	StopSoon(unit string) error
 	IsActive(unit string) bool
 	IsEnabled(unit string) bool
 	// Run executes a command and returns its combined output. The output is
@@ -63,9 +75,22 @@ func (systemd) EnableNow(unit string) error {
 // is-active and is-enabled exit non-zero for anything that is not, which is the
 // question being asked, so the exit code is the answer.
 func (systemd) Disable(unit string) error {
-	out, err := exec.Command("systemctl", "disable", "--now", unit).CombinedOutput()
+	out, err := exec.Command("systemctl", "disable", unit).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s could not be stopped and disabled: %v\n%s", unit, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%s could not be kept from coming back at the next boot: %v\n%s",
+			unit, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (systemd) StopSoon(unit string) error {
+	// --no-block: systemd queues the job and systemctl returns at once. Without
+	// it, stopping the unit this process belongs to kills the process before
+	// systemctl can report, and the caller reads its own death as an error.
+	out, err := exec.Command("systemctl", "--no-block", "stop", unit).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s was asked to stop and systemd refused: %v\n%s",
+			unit, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
