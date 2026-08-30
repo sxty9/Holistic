@@ -31,6 +31,8 @@ type fakeCF struct {
 	zoneErr error
 	records []DNSRecord
 	recErr  error
+	names   []string
+	nameErr error
 }
 
 func newFakeCF() *fakeCF {
@@ -42,7 +44,15 @@ func newFakeCF() *fakeCF {
 			Permissions: []string{"#zone:read", "#dns_records:read", "#dns_records:edit",
 				"#zone_settings:edit", "#email_routing_rule:edit"},
 		},
+		names: []string{testDomain},
 	}
+}
+
+func (f *fakeCF) ZoneNames(_ context.Context, _ string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asked = append(f.asked, "zone-names")
+	return f.names, f.nameErr
 }
 
 func (f *fakeCF) note(s string) { f.mu.Lock(); f.asked = append(f.asked, s); f.mu.Unlock() }
@@ -1118,5 +1128,90 @@ func TestSetupIsNotClosedWithoutBeingAsked(t *testing.T) {
 	}
 	if _, err := os.Stat(k.p.Seal); err == nil {
 		t.Error("it wrote the seal without being told to")
+	}
+}
+
+// The token step used to end by saying the question could not be asked: "whether
+// the token also reaches other zones cannot be read back: that needs User API
+// Tokens Read". That is true of the token's own definition and false of its
+// reach — GET /zones with no filter answers it. Measured against a real token
+// on 2026-08-30 that looked single-zone on this zone's own answer and carried
+// two.
+func TestATokenThatReachesOtherZonesSaysWhichOnes(t *testing.T) {
+	k := newKit(t)
+	k.cf.names = []string{testDomain, "somewhere-else.invalid", "third.invalid"}
+	k.answer("domain", testDomain)
+	k.run("domain")
+	k.answer("token-verify", "cfut-whatever")
+	row := k.run("token-verify")
+
+	if row.Status != ledger.Passed {
+		t.Fatalf("a sufficient token did not pass: %s %s", row.Status, row.Detail)
+	}
+	for _, other := range []string{"somewhere-else.invalid", "third.invalid"} {
+		if !strings.Contains(row.Proof, other) {
+			t.Errorf("%s is inside this machine's reach and is not named: %q", other, row.Proof)
+		}
+	}
+	if strings.Contains(row.Proof, "cannot be read back") {
+		t.Error("the proof still claims the reach is unknowable")
+	}
+}
+
+// A single-zone token is the shape the whole design asks for, and must be told
+// so plainly — a warning that appears on the correct case teaches people to
+// skip warnings.
+func TestASingleZoneTokenIsSaidToBeSingleZone(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.run("domain")
+	k.answer("token-verify", "cfut-whatever")
+	row := k.run("token-verify")
+
+	if !strings.Contains(row.Proof, "no other") {
+		t.Errorf("a single-zone token was not confirmed as one: %q", row.Proof)
+	}
+	if strings.Contains(row.Proof, "also reaches") {
+		t.Errorf("a single-zone token was reported as reaching further: %q", row.Proof)
+	}
+}
+
+// Listing zones is a warning the step would like to give, not one it depends
+// on: the grant on THIS zone is what the wizard needs. A token whose account
+// forbids the listing must still get through, and must say why it is quiet.
+func TestAFailedReachLookupDoesNotFailTheStep(t *testing.T) {
+	k := newKit(t)
+	k.cf.nameErr = errors.New("403 forbidden")
+	k.answer("domain", testDomain)
+	k.run("domain")
+	k.answer("token-verify", "cfut-whatever")
+	row := k.run("token-verify")
+
+	if row.Status != ledger.Passed {
+		t.Fatalf("a sufficient token was rejected because a warning could not be produced: %s %s", row.Status, row.Detail)
+	}
+	if !strings.Contains(row.Proof, "could not be read") {
+		t.Errorf("the step went quiet about the reach without saying so: %q", row.Proof)
+	}
+}
+
+// A token wider than the four rows asked for still works, and must not pass in
+// silence. This is the token this instance was handed on 2026-08-30.
+func TestAWiderTokenPassesAndIsNamedAsWider(t *testing.T) {
+	k := newKit(t)
+	k.cf.zone.Permissions = append(k.cf.zone.Permissions,
+		"#zone:edit", "#page_shield:edit", "#page_shield:read", "#ssl:read")
+	k.answer("domain", testDomain)
+	k.run("domain")
+	k.answer("token-verify", "cfut-whatever")
+	row := k.run("token-verify")
+
+	if row.Status != ledger.Passed {
+		t.Fatalf("a token that carries everything needed was refused for carrying more: %s", row.Detail)
+	}
+	for _, extra := range []string{"page_shield:edit", "ssl:read", "zone:edit"} {
+		if !strings.Contains(row.Detail, extra) {
+			t.Errorf("%s was carried and the ledger line does not say so: %q", extra, row.Detail)
+		}
 	}
 }

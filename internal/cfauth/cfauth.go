@@ -258,6 +258,7 @@ func JudgeZone(active bool, zonePerms []string, want []Permission) Verdict {
 	v := Verdict{Valid: active}
 
 	granted := map[string]bool{}
+	asked := map[string]bool{}
 	for _, p := range zonePerms {
 		granted[strings.TrimPrefix(strings.ToLower(strings.TrimSpace(p)), "#")] = true
 	}
@@ -271,7 +272,32 @@ func JudgeZone(active bool, zonePerms []string, want []Permission) Verdict {
 		if !granted[scope+":"+p.Type] {
 			v.Missing = append(v.Missing, p)
 		}
+		asked[scope+":"+p.Type] = true
+		// An edit implies the read, so a token that carries both when only edit
+		// was asked for is not carrying anything extra.
+		if p.Type == "edit" {
+			asked[scope+":read"] = true
+		}
 	}
+
+	// The other direction, which the Missing loop above does not cover and
+	// which no comparable project checks: what did this token bring that
+	// nobody asked for? Verdict has carried an Excess field and Explain has
+	// printed it since this package was written; nothing ever filled it, so
+	// the read-back only ever answered half its own question.
+	//
+	// Reported, not refused. A token wider than the request still does the
+	// job, and turning "you gave me more than I need" into a hard stop makes
+	// the wizard unusable for anybody reusing a token they already trust. What
+	// it must not do is stay silent: "I asked for exactly these four rows and
+	// yours has nine" is the difference between a paste box and a grant
+	// somebody can audit.
+	for g := range granted {
+		if !asked[g] {
+			v.Excess = append(v.Excess, g)
+		}
+	}
+	sort.Strings(v.Excess)
 	return v
 }
 

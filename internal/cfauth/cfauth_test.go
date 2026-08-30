@@ -281,3 +281,62 @@ func TestJudgeZoneRefusesAnInactiveToken(t *testing.T) {
 		t.Error("it also reported permissions missing, which confuses two different problems")
 	}
 }
+
+// The read-back exists to compare what was asked for with what arrived, and it
+// only ever did half of that. Verdict.Excess and Explain's line about it were
+// written at the start; JudgeZone never filled the field, so a token carrying
+// five groups nobody requested read as a clean match.
+//
+// The token this instance was handed on 2026-08-30 is the case: it carried
+// zone:edit, page_shield:edit, page_shield:read and ssl:read on top of the four
+// rows the wizard asks for, and the wizard said only that one row was missing.
+func TestAWiderTokenThanAskedForIsNamed(t *testing.T) {
+	want := []Permission{
+		{Key: "zone", Type: "read"},
+		{Key: "dns", Type: "edit"},
+		{Key: "zone_settings", Type: "edit"},
+		{Key: "email_routing_rule", Type: "edit"},
+	}
+	v := JudgeZone(true, []string{
+		"#zone:read", "#zone:edit",
+		"#dns_records:read", "#dns_records:edit",
+		"#zone_settings:read", "#zone_settings:edit",
+		"#page_shield:read", "#page_shield:edit",
+		"#ssl:read",
+	}, want)
+
+	if len(v.Missing) != 1 || v.Missing[0].Key != "email_routing_rule" {
+		t.Fatalf("Missing = %+v, want just email_routing_rule", v.Missing)
+	}
+	got := strings.Join(v.Excess, " ")
+	for _, extra := range []string{"zone:edit", "page_shield:edit", "page_shield:read", "ssl:read"} {
+		if !strings.Contains(got, extra) {
+			t.Errorf("%s was carried and not named: Excess = %v", extra, v.Excess)
+		}
+	}
+	// The reads that come with an edit are not excess. Cloudflare lists both
+	// for one row on the form, and calling the read surplus would tell the
+	// operator to remove a row they cannot remove.
+	for _, implied := range []string{"dns_records:read", "zone_settings:read"} {
+		if strings.Contains(got, implied) {
+			t.Errorf("%s is implied by the edit that was asked for, but was reported as excess: %v", implied, v.Excess)
+		}
+	}
+	// zone:read was asked for outright.
+	if strings.Contains(got, "zone:read") {
+		t.Errorf("zone:read was requested and reported as excess: %v", v.Excess)
+	}
+}
+
+// A token that is exactly what was asked for must produce no complaint at all —
+// otherwise the excess line appears on every correct setup and stops being read.
+func TestAnExactTokenHasNothingSaidAboutIt(t *testing.T) {
+	want := []Permission{
+		{Key: "zone", Type: "read"},
+		{Key: "dns", Type: "edit"},
+	}
+	v := JudgeZone(true, []string{"#zone:read", "#dns_records:read", "#dns_records:edit"}, want)
+	if len(v.Missing) != 0 || len(v.Excess) != 0 {
+		t.Errorf("an exact token was judged Missing=%v Excess=%v", v.Missing, v.Excess)
+	}
+}

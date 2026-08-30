@@ -2,6 +2,7 @@ package steps
 
 import (
 	"fmt"
+	"strconv"
 
 	"context"
 	"encoding/json"
@@ -89,6 +90,21 @@ func stepTokenVerify() Step {
 			e.given.zone = z
 
 			v := cfauth.JudgeZone(active, z.Permissions, cfauth.Setup())
+
+			// Said whether the token passes or fails. A grant wider than the
+			// request is not a reason to refuse — it does the job, and a hard
+			// stop would make the wizard unusable for anybody reusing a token
+			// they already trust — but it must not pass in silence. The whole
+			// point of reading the grant back is to compare it with what was
+			// asked for, and that comparison has two directions.
+			excess := ""
+			if len(v.Excess) > 0 {
+				excess = "\n\nThis token also carries " + strconv.Itoa(len(v.Excess)) +
+					" thing(s) the wizard did not ask for: " + strings.Join(v.Excess, ", ") +
+					". They are not needed here, and each one is something this machine could do to " +
+					"your zone if it were ever taken. Removing them is the same edit as adding a row."
+			}
+
 			if !v.OK() {
 				var want []string
 				for _, m := range v.Missing {
@@ -104,18 +120,34 @@ func stepTokenVerify() Step {
 						"arrives. Everything else would appear to succeed.",
 					Resolution: "Cloudflare -> My Profile -> API Tokens -> edit this token, add the rows above, " +
 						"and Continue to summary -> Update token. Then check again.\n\n" +
-						"The token itself does not change, so nothing on this machine has to be updated.",
+						"The token itself does not change, so nothing on this machine has to be updated." + excess,
 					Consequence: "inbound mail is not set up. Everything that does not need it still works.",
 				})
 			}
-			// What it cannot say, said. A token scoped to every zone in the
-			// account answers identically here, and reading a token's own
-			// definition needs a permission it deliberately does not carry.
+			// How far the token reaches. This used to say the question could
+			// not be asked without User API Tokens Read; that is true of the
+			// token's own definition and false of its reach, which the zones
+			// answer themselves. Measured on 2026-08-30 against a token that
+			// looked single-zone here and turned out to carry two.
+			//
+			// A failure to list is not a failure of the step: the grant on
+			// THIS zone is what the wizard needs, and this is a warning it
+			// would like to give rather than one it depends on.
+			reach := ""
+			if names, err := e.cf.ZoneNames(context.Background(), tok); err != nil {
+				reach = " How far the token reaches beyond this zone could not be read: " + err.Error()
+			} else if len(names) > 1 {
+				reach = " It also reaches " + strconv.Itoa(len(names)-1) + " other zone(s): " +
+					strings.Join(without(names, z.Name), ", ") +
+					". A token scoped to one zone takes the same number of clicks and keeps them out of reach."
+			} else {
+				reach = " It reaches this zone and no other."
+			}
+
 			return passed(
-				"valid, and carries what this zone needs",
+				"valid, and carries what this zone needs"+shorten(excess),
 				"zone "+z.Name+" reports: "+strings.Join(z.Permissions, ", ")+
-					" — this is the grant ON THIS ZONE. Whether the token also reaches other zones cannot be "+
-					"read back: that needs User API Tokens Read, which this token does not have and should not.")
+					" — this is the grant ON THIS ZONE."+reach)
 		},
 	}
 }
@@ -524,4 +556,26 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// shorten turns the excess note into something that fits on a ledger line. The
+// full sentence belongs in a conflict report; a passed step gets the count and
+// the names, because a line nobody can read is a line nobody reads.
+func shorten(excess string) string {
+	if excess == "" {
+		return ""
+	}
+	i := strings.Index(excess, "did not ask for: ")
+	return " — and " + excess[i+len("did not ask for: "):strings.Index(excess, ". They are not")] + ", which it did not need"
+}
+
+// without is names minus one of them, so a list of "the others" reads as one.
+func without(names []string, drop string) []string {
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if !strings.EqualFold(n, drop) {
+			out = append(out, n)
+		}
+	}
+	return out
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -30,6 +31,13 @@ type Cloudflare interface {
 	Zone(ctx context.Context, token, domain string) (Zone, error)
 	// Records lists the zone as it stands.
 	Records(ctx context.Context, token, zoneID string) ([]DNSRecord, error)
+	// ZoneNames lists every zone this token can see, which is how far it
+	// reaches. The code here used to say that could not be read back without
+	// User API Tokens Read — measured on 2026-08-30 and false: GET /zones with
+	// no name filter answers with every zone the token is scoped to. What needs
+	// that permission is reading the token's own DEFINITION; how far it reaches
+	// in practice is a question the zones themselves answer.
+	ZoneNames(ctx context.Context, token string) ([]string, error)
 }
 
 type Zone struct {
@@ -155,6 +163,21 @@ func (l *liveCF) Zone(ctx context.Context, token, domain string) (Zone, error) {
 		ID: z.ID, Name: z.Name, Status: z.Status, AccountID: z.Account.ID,
 		Nameservers: z.NameServers, Permissions: z.Permissions,
 	}, nil
+}
+
+func (l *liveCF) ZoneNames(ctx context.Context, token string) ([]string, error) {
+	var zs []struct {
+		Name string `json:"name"`
+	}
+	if err := l.get(ctx, token, "/zones", &zs); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(zs))
+	for _, z := range zs {
+		out = append(out, z.Name)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 func (l *liveCF) Records(ctx context.Context, token, zoneID string) ([]DNSRecord, error) {
