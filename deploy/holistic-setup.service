@@ -52,8 +52,28 @@ ReadWritePaths=@CONF@ @STATE@ /etc/corex /etc/solisuite /etc/warpgate /etc/syste
 # The setup process answers on the local network only. This is belt to the
 # code's braces: the listener already binds named interfaces rather than
 # 0.0.0.0, and refuses requests that did not arrive from a private address.
-IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 fe80::/10
-IPAddressDeny=any
+# NO IPAddressDeny. It was here, allowing only private ranges, and it was
+# removed deliberately on 2026-08-30 after it silently broke half the wizard.
+#
+# systemd's address filter applies in BOTH directions. Confining this unit to
+# private ranges did keep the setup page local — and it also stopped the wizard
+# from reaching Cloudflare to verify a token or resolve a zone, and from
+# fetching its own hostnames from the public internet to prove they answer.
+# Every one of those steps failed with "could not reach Cloudflare", which reads
+# like a network fault and is a unit file.
+#
+# What keeps the page local is in the code, and it is stronger than this was:
+#
+#   lan.Listen binds this machine's LAN addresses and loopback, one socket
+#   each, and never 0.0.0.0 — so there is no socket for a stranger to reach.
+#
+#   lan.OnlyLocal refuses any client whose address is not private, and refuses
+#   a request that arrived under a Host this instance does not answer to. Nine
+#   tests in internal/lan pin both.
+#
+# Allowing Cloudflare's ranges instead was considered and does not work: they
+# change, and the nonce probe has to reach whatever anycast address the zone's
+# hostnames resolve to today.
 
 Restart=on-failure
 RestartSec=5s
