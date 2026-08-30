@@ -93,3 +93,58 @@ func TestReopeningAnInstanceThatWasNeverSealedIsRefused(t *testing.T) {
 		t.Error("a setup code was left behind by a reopen that failed")
 	}
 }
+
+// The listener reads the claim once, at start, and builds its routes from it.
+// So minting a code without restarting produces a code that cannot be redeemed
+// — and this command tells the operator the opposite. Observed live: a freshly
+// minted code met 404 on POST /claim/, because the process had started with no
+// claim at all and had registered no such route.
+func TestMintingACodeMakesTheRunningListenerTakeIt(t *testing.T) {
+	conf := t.TempDir()
+
+	var calls []string
+	code, restarted, err := mintInto(conf, func(name string, args ...string) (string, error) {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		// The code has to be on disk before the restart, or the listener comes
+		// back up and reads nothing.
+		if _, err := os.Stat(filepath.Join(conf, "setup.claim")); err != nil {
+			t.Errorf("the listener was restarted before the code was written: %v", err)
+		}
+		return "", nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restarted {
+		t.Error("the restart succeeded but was reported as not done, so the operator is told to doubt a code that works")
+	}
+	want := "systemctl try-restart " + setupUnit
+	if len(calls) != 1 || calls[0] != want {
+		t.Errorf("systemctl calls = %v, want exactly [%q]. Plain `restart` would START a unit that is "+
+			"stopped on purpose, which is the reopen and has its own confirmation", calls, want)
+	}
+	on, err := os.ReadFile(filepath.Join(conf, "setup.claim"))
+	if err != nil || strings.TrimSpace(string(on)) != code {
+		t.Errorf("the code printed is not the code on disk: %q vs %q (%v)", code, strings.TrimSpace(string(on)), err)
+	}
+}
+
+// A failed restart must not throw the code away: it is on disk and a reboot or a
+// manual restart will pick it up. What must not happen is printing it as though
+// the running process had taken it.
+func TestAFailedRestartStillYieldsTheCodeAndSaysSo(t *testing.T) {
+	conf := t.TempDir()
+	code, restarted, err := mintInto(conf, func(string, ...string) (string, error) {
+		return "Failed to restart holistic-setup.service", os.ErrPermission
+	})
+	if err != nil {
+		t.Fatalf("a failed restart discarded a code that is already on disk: %v", err)
+	}
+	if restarted {
+		t.Error("a failed restart was reported as done")
+	}
+	on, _ := os.ReadFile(filepath.Join(conf, "setup.claim"))
+	if strings.TrimSpace(string(on)) != code {
+		t.Errorf("the code on disk is not the one returned: %q vs %q", strings.TrimSpace(string(on)), code)
+	}
+}

@@ -183,17 +183,16 @@ func cmdCode(args []string) error {
 			"(%s/claimed is what records it.)", *conf)
 	}
 
-	code, err := mintCode()
+	code, restarted, err := mintInto(*conf, runCmd)
 	if err != nil {
-		return err
-	}
-	if err := writeClaim(*conf, code); err != nil {
 		return err
 	}
 
 	fmt.Printf("\n  setup code   %s\n\n", code)
-	fmt.Println("  It is shown here and nowhere else. The previous code, if there was one,")
-	fmt.Println("  no longer works.")
+	fmt.Println("  It is shown here and nowhere else.")
+	if restarted {
+		fmt.Printf("  %s was restarted, so this is the code it now accepts.\n", setupUnit)
+	}
 	return nil
 }
 
@@ -484,4 +483,33 @@ func reopenSetup(conf string, systemctl func(string, ...string) (string, error))
 		return "", fmt.Errorf("unclaimed, but %s did not come up: %v\n%s", setupUnit, err, out)
 	}
 	return code, nil
+}
+
+// mintInto writes a fresh setup code and makes the running listener pick it up,
+// with systemctl passed in so the order can be proven without a machine.
+//
+// The listener decides at start whether a claim exists and builds its routes
+// from that once. A process started with no claim serves one page saying there
+// is no code and registers no /claim route at all — so a code minted while it
+// runs cannot be redeemed, ever, and this command used to say "the previous
+// code no longer works" over a process still holding it. Observed live on
+// 2026-08-30: a freshly minted code met a 404 on POST /claim/.
+//
+// try-restart, not restart: a unit that is stopped is stopped on purpose, and
+// starting it here would be the reopen, which is a separate deliberate act with
+// its own confirmation.
+func mintInto(conf string, systemctl func(string, ...string) (string, error)) (string, bool, error) {
+	code, err := mintCode()
+	if err != nil {
+		return "", false, err
+	}
+	if err := writeClaim(conf, code); err != nil {
+		return "", false, err
+	}
+	if out, err := systemctl("systemctl", "try-restart", setupUnit); err != nil {
+		fmt.Fprintf(os.Stderr, "\n  warning: %s was not restarted, so it may still be holding the previous\n"+
+			"  code — or none at all: %v\n  %s\n", setupUnit, err, out)
+		return code, false, nil
+	}
+	return code, true, nil
 }
