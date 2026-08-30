@@ -4,24 +4,21 @@ What `holistic-setup` serves on the local network before an instance is claimed,
 and the status page it serves afterwards. `docs/setup-api.md` is the contract
 between this and the Go half; read that first.
 
-## The dependency that is not published yet
-
-`package.json` pins `@finessefx/ui` at `github:sxty9/FinesseFX#v0.2.0`, and
-**that tag does not exist yet.** These pages are built around `Stepper`, and
-`Stepper` postdates `v0.1.2` — the newest tag there is — so nothing here can be
-installed from the published package until FinesseFX is tagged and pushed.
-
-Until then, develop against the working copy:
+## Installing
 
 ```sh
-pnpm install
-pnpm add --save-dev --config.node-linker=hoisted ../../FinesseFX   # or:
-npm install --no-save ../../FinesseFX
+npm install     # or pnpm install
+npm run dev     # vite on :5200, proxying /api to the setup daemon on :8799
+npm run build   # tsc --noEmit && vite build, into dist/
 ```
 
-That path is deliberately not written into `package.json`. A machine path in a
-manifest builds on exactly one machine, and finding that out is somebody else's
-afternoon.
+`@finessefx/ui` comes from a git tag, not a registry — `github:sxty9/FinesseFX#v0.2.0`
+— which works because FinesseFX commits its own `dist/`. There is no build step
+on install; the tag is the package.
+
+`v0.2.0` is the first tag carrying `Stepper`, which these pages are built
+around. Anything older resolves and then fails to compile, which is a confusing
+way to find out you are on the wrong tag.
 
 ## Why the pages are shaped the way they are
 
