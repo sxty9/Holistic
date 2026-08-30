@@ -234,22 +234,37 @@ func TestUnreadableAnswersAreAnError(t *testing.T) {
 func TestJudgeZoneReadsTheEffectiveGrant(t *testing.T) {
 	live := []string{"#dns_records:edit", "#dns_records:read", "#zone:read"}
 
+	// Only zone_settings:edit. email_routing_rule is NOT judged from this
+	// array — Cloudflare does not report it there whether the token carries it
+	// or not, so its absence says nothing. This test asserted the opposite
+	// until 2026-08-30, when a token whose Cloudflare form showed all four rows
+	// was refused by a check the operator had no way to satisfy.
 	v := JudgeZone(true, live, Setup())
 	if v.OK() {
-		t.Fatal("the setup credential was judged complete; it carries neither zone_settings:edit nor email_routing_rule:edit")
+		t.Fatal("the setup credential was judged complete; it does not carry zone_settings:edit")
 	}
 	var missing []string
 	for _, p := range v.Missing {
 		missing = append(missing, p.Key+":"+p.Type)
 	}
-	want := []string{"zone_settings:edit", "email_routing_rule:edit"}
-	if len(missing) != len(want) {
-		t.Fatalf("missing = %v, want exactly %v", missing, want)
+	if len(missing) != 1 || missing[0] != "zone_settings:edit" {
+		t.Fatalf("missing = %v, want exactly [zone_settings:edit]", missing)
 	}
-	for i := range want {
-		if missing[i] != want[i] {
-			t.Errorf("missing[%d] = %s, want %s", i, missing[i], want[i])
-		}
+
+	// And email routing is judged from the answer Cloudflare gives when asked.
+	full := append(append([]string{}, live...), "#zone_settings:edit", "#zone_settings:read")
+	if w := JudgeZoneWith(true, full, Setup(), map[string]bool{"email_routing_rule": false}); w.OK() {
+		t.Error("a token Cloudflare says cannot write email routing rules was judged complete")
+	} else if len(w.Missing) != 1 || w.Missing[0].Key != "email_routing_rule" {
+		t.Errorf("missing = %+v, want just email_routing_rule", w.Missing)
+	}
+	if w := JudgeZoneWith(true, full, Setup(), map[string]bool{"email_routing_rule": true}); !w.OK() {
+		t.Errorf("a token Cloudflare says CAN write email routing rules was refused: %+v", w.Missing)
+	}
+	// A probe that could not run is not evidence. Refusing on a check that
+	// failed to happen is the failure this wizard exists to prevent.
+	if w := JudgeZoneWith(true, full, Setup(), map[string]bool{}); !w.OK() {
+		t.Errorf("an unanswered probe was read as a refusal: %+v", w.Missing)
 	}
 
 	// The runtime credential is DNS alone, and this token satisfies it. That is

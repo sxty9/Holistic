@@ -49,6 +49,11 @@ type Permission struct {
 	Label   string `json:"-"`
 	APIName string `json:"-"`
 	Why     string `json:"-"`
+	// AskCloudflare marks a permission the zone's own answer cannot report, so
+	// judging it means asking the endpoint whether the write is allowed instead
+	// of looking it up. JudgeZone skips these entirely; the caller supplies the
+	// answer through JudgeZoneWith.
+	AskCloudflare bool `json:"-"`
 }
 
 // Setup is the credential the wizard needs, and the whole of it.
@@ -69,7 +74,22 @@ func Setup() []Permission {
 		{Key: "zone_settings", Type: "edit", Label: "Zone → Zone Settings → Edit", APIName: "Zone Settings Write",
 			Why: "Turn on Email Routing, which is what makes inbound mail arrive."},
 		{Key: "email_routing_rule", Type: "edit", Label: "Zone → Email Routing Rules → Edit", APIName: "Email Routing Rules Write",
-			Why: "Route the addresses this instance answers to its own inbound Worker."},
+			Why: "Route the addresses this instance answers to its own inbound Worker.",
+			// NOT judged from the zone's permissions array, and this is the one
+			// entry that cannot be. GET /zones reports dns_records, zone,
+			// zone_settings, ssl and page_shield; it does not report email
+			// routing at all, whether the token carries it or not.
+			//
+			// Measured on 2026-08-30 against a token whose Cloudflare form
+			// shows all four rows: the array listed nine entries and none of
+			// them was email routing, while POST to the rules endpoint got
+			// through to body validation. So absence in the array meant
+			// nothing, and reading it as "missing" refused a correct token
+			// with no way for the operator to satisfy the check — they had
+			// already added the row.
+			//
+			// AskCloudflare says how the real answer is obtained.
+			AskCloudflare: true},
 	}
 }
 
@@ -263,6 +283,10 @@ func JudgeZone(active bool, zonePerms []string, want []Permission) Verdict {
 		granted[strings.TrimPrefix(strings.ToLower(strings.TrimSpace(p)), "#")] = true
 	}
 	for _, p := range want {
+		if p.AskCloudflare {
+			// Not in the array, and never will be. Judged by JudgeZoneWith.
+			continue
+		}
 		scope := p.Key
 		if alt, ok := zoneScope[scope]; ok {
 			scope = alt
@@ -298,6 +322,27 @@ func JudgeZone(active bool, zonePerms []string, want []Permission) Verdict {
 		}
 	}
 	sort.Strings(v.Excess)
+	return v
+}
+
+// JudgeZoneWith is JudgeZone plus the answers to the permissions the zone
+// cannot report. asked maps a permission Key to what Cloudflare said when the
+// caller tried the write — true for allowed.
+//
+// A key missing from asked is treated as unanswered, not as denied: a probe
+// that could not run is not evidence of anything, and refusing a token because
+// a check failed to happen is the shape of failure this whole wizard exists to
+// avoid.
+func JudgeZoneWith(active bool, zonePerms []string, want []Permission, asked map[string]bool) Verdict {
+	v := JudgeZone(active, zonePerms, want)
+	for _, p := range want {
+		if !p.AskCloudflare {
+			continue
+		}
+		if allowed, answered := asked[p.Key]; answered && !allowed {
+			v.Missing = append(v.Missing, p)
+		}
+	}
 	return v
 }
 

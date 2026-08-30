@@ -33,6 +33,12 @@ type fakeCF struct {
 	recErr  error
 	names   []string
 	nameErr error
+	// mailWrite is what Cloudflare says when asked whether this token may
+	// create email routing rules. True by default: a token that can do
+	// everything is the ordinary case, and a fake that denied by default would
+	// make every unrelated test go through the refusal path.
+	mailWrite    bool
+	mailWriteErr error
 }
 
 func newFakeCF() *fakeCF {
@@ -44,8 +50,16 @@ func newFakeCF() *fakeCF {
 			Permissions: []string{"#zone:read", "#dns_records:read", "#dns_records:edit",
 				"#zone_settings:edit", "#email_routing_rule:edit"},
 		},
-		names: []string{testDomain},
+		names:     []string{testDomain},
+		mailWrite: true,
 	}
+}
+
+func (f *fakeCF) CanWriteEmailRouting(_ context.Context, _, _ string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asked = append(f.asked, "can-write-email-routing")
+	return f.mailWrite, f.mailWriteErr
 }
 
 func (f *fakeCF) ZoneNames(_ context.Context, _ string) ([]string, error) {
@@ -1274,4 +1288,76 @@ func TestAHostnameUnderAnotherDomainStillSaysWrongMachine(t *testing.T) {
 	if c == nil || !strings.Contains(c.Resolution, "wrong machine") {
 		t.Errorf("a foreign hostname did not get the wrong-machine sentence: %+v", c)
 	}
+}
+
+// A token whose Cloudflare form shows all four rows was refused, and the
+// operator had no way to satisfy the check: GET /zones reports dns_records,
+// zone, zone_settings, ssl and page_shield in its permissions array, and does
+// not report email routing at all. Absence there meant nothing, and the step
+// read it as missing.
+func TestEmailRoutingIsAskedAboutRatherThanLookedUp(t *testing.T) {
+	k := newKit(t)
+	// Exactly what the real zone answered on 2026-08-30: everything the wizard
+	// needs except any mention of email routing.
+	k.cf.zone.Permissions = []string{
+		"#zone:read", "#zone:edit", "#dns_records:read", "#dns_records:edit",
+		"#zone_settings:read", "#zone_settings:edit",
+	}
+	k.cf.mailWrite = true
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.answer("token-verify", "cfut-whatever")
+	row := k.run("token-verify")
+
+	if row.Status != ledger.Passed {
+		t.Fatalf("a token Cloudflare says may write email routing rules was refused: %s %s", row.Status, row.Detail)
+	}
+	if !contains(k.cf.asked, "can-write-email-routing") {
+		t.Error("the step never asked Cloudflare; it can only have judged from the array, which cannot answer")
+	}
+}
+
+// And a token that genuinely cannot must still be held, with the row named.
+func TestATokenThatCannotWriteEmailRoutingIsHeld(t *testing.T) {
+	k := newKit(t)
+	k.cf.mailWrite = false
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.answer("token-verify", "cfut-whatever")
+	row := k.run("token-verify")
+
+	if row.Status != ledger.Conflict {
+		t.Fatalf("a token that cannot create mail routing rules passed: %s %s", row.Status, row.Detail)
+	}
+	if row.Conflict == nil || !strings.Contains(row.Conflict.Desired, "Email Routing Rules") {
+		t.Errorf("the report does not name the row to add: %+v", row.Conflict)
+	}
+}
+
+// Asking can fail — a network error, a Cloudflare outage. That is not a
+// refusal. A token that is otherwise sufficient must go through, and the step
+// must say the question went unanswered rather than staying quiet about it.
+func TestAFailedEmailRoutingProbeDoesNotRefuseTheToken(t *testing.T) {
+	k := newKit(t)
+	k.cf.mailWriteErr = errors.New("connection reset")
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.answer("token-verify", "cfut-whatever")
+	row := k.run("token-verify")
+
+	if row.Status != ledger.Passed {
+		t.Fatalf("a token was refused because a probe could not run: %s %s", row.Status, row.Detail)
+	}
+	if !strings.Contains(row.Proof, "could not be established") {
+		t.Errorf("the step went quiet about the unanswered question: %q", row.Proof)
+	}
+}
+
+func contains(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }

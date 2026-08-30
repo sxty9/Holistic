@@ -3,6 +3,7 @@ package steps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -13,7 +14,12 @@ import (
 
 // Cloudflare is the seam through which this package reads from Cloudflare.
 //
-// IT HAS NO WRITE, and that is the design rather than an unfinished half.
+// IT CREATES NOTHING, and that is the design rather than an unfinished half.
+//
+// One method sends a POST — CanWriteEmailRouting, which asks whether a write
+// would be allowed by making one that Cloudflare's own validator refuses. It
+// cannot bring a rule into existence, and it errors rather than returning true
+// if Cloudflare ever accepts it.
 // Warpgate owns the edge: it is where the ownership marker lives, where a
 // record that was not created here becomes a Conflict instead of an overwrite,
 // where deletions get their own confirmation, and where the journal of what was
@@ -38,6 +44,11 @@ type Cloudflare interface {
 	// that permission is reading the token's own DEFINITION; how far it reaches
 	// in practice is a question the zones themselves answer.
 	ZoneNames(ctx context.Context, token string) ([]string, error)
+	// CanWriteEmailRouting answers whether the token may create email routing
+	// rules on this zone. It has to be asked rather than looked up: GET /zones
+	// reports dns_records, zone, zone_settings, ssl and page_shield in its
+	// permissions array and does not report email routing at all.
+	CanWriteEmailRouting(ctx context.Context, token, zoneID string) (bool, error)
 }
 
 type Zone struct {
@@ -178,6 +189,57 @@ func (l *liveCF) ZoneNames(ctx context.Context, token string) ([]string, error) 
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// CanWriteEmailRouting asks by trying, with a body that cannot succeed.
+//
+// Cloudflare checks authorisation BEFORE it validates the body. Measured on
+// 2026-08-30 against one token, on four endpoints, with an empty or minimal
+// body each time:
+//
+//	POST /zones/{z}/firewall/rules   -> 403, code 10000 "Authentication error"
+//	POST /zones/{z}/rulesets         -> 403, code 10000 "Authentication error"
+//	POST /zones/{z}/dns_records      -> 400, code 9000  "DNS name is invalid"
+//	POST /zones/{z}/email/routing/rules -> 422, code 2007 "must have actions"
+//
+// The token carried DNS Edit and not firewall. So a 403 with code 10000 means
+// the permission is absent, and a body-validation error means the request got
+// past authorisation — which is the whole question, answered without creating
+// anything. `{"matchers":[],"actions":[]}` is refused by Cloudflare's own
+// validator, so no rule can come into existence here even if the permission is
+// present.
+func (l *liveCF) CanWriteEmailRouting(ctx context.Context, token, zoneID string) (bool, error) {
+	body := strings.NewReader(`{"matchers":[],"actions":[]}`)
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		cfAPI+"/zones/"+url.PathEscape(zoneID)+"/email/routing/rules", body)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	res, err := l.c.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("could not reach Cloudflare: %w", err)
+	}
+	defer res.Body.Close()
+
+	var env envelope
+	if err := json.NewDecoder(res.Body).Decode(&env); err != nil {
+		return false, fmt.Errorf("Cloudflare answered %s with something that is not JSON: %w", res.Status, err)
+	}
+	if env.Success {
+		// It cannot succeed on this body. If it ever does, Cloudflare has
+		// changed under us and a rule may now exist that nobody asked for —
+		// say so rather than returning a cheerful true.
+		return false, errors.New("Cloudflare accepted a request that should have been rejected as invalid; " +
+			"check this zone's email routing rules by hand before continuing")
+	}
+	for _, e := range env.Errors {
+		if e.Code == 10000 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (l *liveCF) Records(ctx context.Context, token, zoneID string) ([]DNSRecord, error) {

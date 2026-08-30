@@ -89,7 +89,26 @@ func stepTokenVerify() Step {
 			}
 			e.given.zone = z
 
-			v := cfauth.JudgeZone(active, z.Permissions, cfauth.Setup())
+			// Email routing has to be asked about; the zone's permissions
+			// array does not report it either way. An error asking is not a
+			// refusal: the answer is left out of the map, and JudgeZoneWith
+			// treats an unanswered permission as unjudged rather than missing.
+			// Refusing a token because a check could not run is the failure
+			// this wizard exists to prevent.
+			asked := map[string]bool{}
+			mailNote := ""
+			if ok, err := e.cf.CanWriteEmailRouting(context.Background(), tok, z.ID); err != nil {
+				mailNote = " Whether it may create email routing rules could not be established: " + err.Error() +
+					" — the mail steps will say so when they get there."
+			} else {
+				asked["email_routing_rule"] = ok
+				if ok {
+					mailNote = " It may create email routing rules, asked directly: " +
+						"the zone's permissions array does not report that one either way."
+				}
+			}
+
+			v := cfauth.JudgeZoneWith(active, z.Permissions, cfauth.Setup(), asked)
 
 			// Said whether the token passes or fails. A grant wider than the
 			// request is not a reason to refuse — it does the job, and a hard
@@ -147,7 +166,7 @@ func stepTokenVerify() Step {
 			return passed(
 				"valid, and carries what this zone needs"+shorten(excess),
 				"zone "+z.Name+" reports: "+strings.Join(z.Permissions, ", ")+
-					" — this is the grant ON THIS ZONE."+reach)
+					" — this is the grant ON THIS ZONE."+mailNote+reach)
 		},
 	}
 }
