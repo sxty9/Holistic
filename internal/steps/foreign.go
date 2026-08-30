@@ -470,7 +470,7 @@ func stepNonceProbe() Step {
 			cat := e.catalogue()
 			var proof strings.Builder
 			var bad []string
-			for _, h := range cat.Hostnames() {
+			for _, h := range cat.WebHostnames() {
 				nonce := fmt.Sprintf("%d-%d", e.now().UnixNano(), len(proof.String()))
 				res, err := e.fetch(context.Background(), "https://"+h+"/?holistic-probe="+nonce)
 				if err != nil {
@@ -487,7 +487,7 @@ func stepNonceProbe() Step {
 			if len(bad) > 0 {
 				return waitingOnThem("not answering from the public internet yet: " + strings.Join(bad, "; "))
 			}
-			return passed(fmt.Sprintf("%d hostname(s) answered from outside", len(cat.Hostnames())), proof.String())
+			return passed(fmt.Sprintf("%d hostname(s) answered from outside", len(cat.WebHostnames())), proof.String())
 		},
 	}
 }

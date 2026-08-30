@@ -266,8 +266,27 @@ func (c Catalogue) CoreXOrigins(proven map[string]bool) map[string]string {
 	return out
 }
 
-// Hostnames is every name that has to resolve for this catalogue to be true —
-// the list the wizard probes, one nonce request each.
+// WebHostnames is every name that can answer an HTTP request, which is the
+// list worth probing with a nonce.
+//
+// Not every published name is one. `ssh` is handed to sshd by cloudflared and
+// will never answer a GET; probing it would fail the nonce step forever and
+// stall the wizard one step from the end, on a hostname that is working
+// perfectly. Judged by the upstream scheme rather than by an app id, so the
+// next non-HTTP route added is right without anybody remembering this.
+func (c Catalogue) WebHostnames() []string {
+	var out []string
+	for _, a := range c.Enabled() {
+		if !strings.HasPrefix(a.Upstream, "http://") && !strings.HasPrefix(a.Upstream, "https://") {
+			continue
+		}
+		out = append(out, c.Hostname(a.ID))
+	}
+	return out
+}
+
+// Hostnames is every name this catalogue publishes — what DNS and ingress must
+// carry. Use WebHostnames for anything that expects an HTTP answer.
 func (c Catalogue) Hostnames() []string {
 	var out []string
 	for _, a := range c.Enabled() {

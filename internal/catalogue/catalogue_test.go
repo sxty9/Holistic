@@ -300,3 +300,39 @@ func TestSSHIsKnownAndOffByDefault(t *testing.T) {
 		}
 	}
 }
+
+// The nonce probe is the last real check before setup closes, and it asks every
+// hostname for an HTTP answer. `ssh` is handed to sshd by cloudflared and will
+// never give one — so probing it would fail that step forever, on a hostname
+// that is working perfectly, one step from the end.
+//
+// Judged by the upstream scheme, not by an app id: the next non-HTTP route
+// added is then right without anybody remembering this.
+func TestOnlyNamesThatSpeakHTTPAreProbed(t *testing.T) {
+	apps := Default()
+	for i := range apps {
+		apps[i].Enabled = true
+	}
+	c := New("example.org", apps)
+
+	all := strings.Join(c.Hostnames(), " ")
+	web := strings.Join(c.WebHostnames(), " ")
+
+	if !strings.Contains(all, "ssh.example.org") {
+		t.Error("ssh is not in Hostnames, so DNS and ingress would not carry it")
+	}
+	if strings.Contains(web, "ssh.example.org") {
+		t.Error("ssh is in WebHostnames: the nonce probe would wait forever on sshd to answer a GET")
+	}
+	// And the ones that do speak HTTP are all still there, routedge included —
+	// it is standalone but it is an HTTP endpoint and it must be proven.
+	for _, h := range []string{"mail.example.org", "routedge.example.org", "roomsense.example.org"} {
+		if !strings.Contains(web, h) {
+			t.Errorf("%s speaks HTTP and is not probed", h)
+		}
+	}
+	if len(c.WebHostnames()) != len(c.Hostnames())-1 {
+		t.Errorf("WebHostnames dropped %d names, want exactly one (ssh): %v",
+			len(c.Hostnames())-len(c.WebHostnames()), c.WebHostnames())
+	}
+}
