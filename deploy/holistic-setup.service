@@ -16,7 +16,7 @@ ConditionPathExists=!@CONF@/claimed
 
 [Service]
 Type=simple
-ExecStart=@PREFIX@/bin/holistic-setup -port @PORT@ -claim @CONF@/setup.claim -ledger @STATE@/provisioned.json -seal @CONF@/claimed
+ExecStart=@PREFIX@/bin/holistic-setup -port @PORT@ -claim @CONF@/setup.claim -ledger @STATE@/provisioned.json -seal @CONF@/claimed -web @PREFIX@/setup-web
 
 # Root, and deliberately so. This process writes /etc/corex, /etc/solisuite and
 # /etc/warpgate, installs units and starts services — that is what setting up an

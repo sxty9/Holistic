@@ -20,7 +20,20 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_ROOT="${SRC_ROOT:-$(dirname "$HERE")}"
 DIST="${DIST:-$HERE/dist}"
-KEY="${HOLISTIC_RELEASE_KEY:-/etc/holistic/release.key}"
+# NOT under /etc/holistic. This is a PUBLISHING secret — it signs releases for
+# everyone who will ever install this — and /etc/holistic is an INSTANCE's
+# configuration directory, which on a machine that runs Holistic is full of that
+# instance's own secrets and owned by its service account.
+#
+# Conflating the two cost nine days. On 2026-08-17 this script created the key
+# and, on the way, ran `install -d -m 0700` against an /etc/holistic that was
+# already the running landscape's secret store. The group execute bit went, and
+# eleven services could no longer traverse into their own configuration. They
+# died at the next boot and restarted every two seconds until 2026-08-30.
+#
+# A build machine and an instance are not the same machine, and when they happen
+# to be the same machine that is a coincidence, not a design.
+KEY="${HOLISTIC_RELEASE_KEY:-/etc/holistic-release/release.key}"
 REPO="${HOLISTIC_REPO:-sxty9/Holistic}"
 
 PLATFORMS=(linux/amd64 linux/arm64)
@@ -231,7 +244,7 @@ build() {
 		goos="${plat%%/*}"
 		goarch="${plat##*/}"
 		stage="$DIST/stage-$goos-$goarch/holistic"
-		mkdir -p "$stage/bin" "$stage/deploy" "$stage/web"
+		mkdir -p "$stage/bin" "$stage/deploy" "$stage/web" "$stage/setup-web"
 
 		note "$goos/$goarch"
 		local c repo pkg out
@@ -272,6 +285,19 @@ build() {
 		else
 			die "Solisuite/web/dist is not there. Build the frontend first:
        cd $SRC_ROOT/Solisuite/web && pnpm install && pnpm build"
+		fi
+
+		# The setup pages, which are a different frontend for a different
+		# audience: Solisuite's is what an instance serves once it is running,
+		# these are what claims it in the first place. v0.0.2 shipped
+		# holistic-setup and none of its pages, so the installer started a
+		# daemon with nothing to show — and nothing said so, because the daemon
+		# fell back to three server-rendered strings and answered 200.
+		if [ -d "$HERE/web/dist" ]; then
+			cp -a "$HERE/web/dist/." "$stage/setup-web/"
+		else
+			die "Holistic/web/dist is not there. Build the setup pages first:
+       cd $HERE/web && npm install && npm run build"
 		fi
 
 		# The version, as a file in the archive. It is the only way to answer

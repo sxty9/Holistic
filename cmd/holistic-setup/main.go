@@ -38,6 +38,7 @@ import (
 	"github.com/sxty9/Holistic/internal/ledger"
 	"github.com/sxty9/Holistic/internal/session"
 	"github.com/sxty9/Holistic/internal/steps"
+	"path/filepath"
 )
 
 // SealPath marks an instance as claimed. It is root-owned and the setup process
@@ -52,10 +53,14 @@ func main() {
 		claimPath = flag.String("claim", claim.Path, "file holding the setup code")
 		ledgerAt  = flag.String("ledger", ledger.DefaultPath, "file recording what setup did")
 		sealAt    = flag.String("seal", SealPath, "file marking this instance as claimed")
+		webDir    = flag.String("web", "", "directory holding the built setup pages; empty serves the plain ones")
 	)
 	flag.Parse()
 
 	srv, err := newServer(*claimPath, *ledgerAt, *sealAt)
+	if err == nil {
+		srv.webDir = usableWeb(*webDir)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "holistic-setup:", err)
 		os.Exit(1)
@@ -74,6 +79,12 @@ type server struct {
 	sealed   bool
 	sealAt   string
 	claimAt  string
+	// webDir holds the built pages, or is empty. Empty is not a failure: the
+	// server-rendered pages below still claim an instance and still say what is
+	// happening. A release that shipped without the frontend should be poorer,
+	// not broken — and finding out which one you have should not require
+	// reading a stack trace.
+	webDir string
 
 	mu      sync.Mutex
 	refused []string // source addresses that offered a wrong code
@@ -156,7 +167,17 @@ func (s *server) routes() http.Handler {
 		return lan.OnlyLocal(mux)
 	}
 
-	mux.HandleFunc("GET /{$}", s.gate)
+	if s.webDir != "" {
+		// The pages decide which screen to show by asking /api/state, never by
+		// reading a cookie of their own — so this is served to anybody, and the
+		// unauthorised answer from the API is what puts the setup code in front
+		// of them. index.html carries no secret; the gate is the API.
+		mux.HandleFunc("GET /{$}", s.page)
+		mux.Handle("GET /assets/", http.StripPrefix("/assets/",
+			http.FileServer(http.Dir(filepath.Join(s.webDir, "assets")))))
+	} else {
+		mux.HandleFunc("GET /{$}", s.gate)
+	}
 	mux.HandleFunc("POST /claim/{$}", s.redeem)
 	mux.Handle("GET /api/state/{$}", s.sessions.Require(http.HandlerFunc(s.state)))
 
@@ -175,6 +196,28 @@ func (s *server) routes() http.Handler {
 // gate is the first thing anybody sees. It asks for the code, and it asks
 // before rendering anything else — the wizard is not served and then guarded at
 // its last step.
+// usableWeb answers whether a directory really holds pages, rather than whether
+// somebody passed a path. A -web pointing at an empty directory would otherwise
+// serve a 404 at / and nothing would say why.
+func usableWeb(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(dir, "index.html")); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"holistic-setup: no index.html under %s, serving the plain pages instead\n", dir)
+		return ""
+	}
+	return dir
+}
+
+func (s *server) page(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	http.ServeFile(w, r, filepath.Join(s.webDir, "index.html"))
+}
+
 func (s *server) gate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	// Nothing here is cacheable and nothing may be framed. The page creates an

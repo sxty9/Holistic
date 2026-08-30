@@ -581,6 +581,16 @@ install_release() {
 	local src="$dir/holistic"
 	[ -d "$src" ] || die "the archive does not look like a Holistic release."
 
+	# The setup pages. A release that predates them has no setup-web/, and the
+	# daemon falls back to the plain server-rendered ones rather than failing —
+	# so this is a copy when there is something to copy, not a requirement.
+	if [ -d "$src/setup-web" ]; then
+		rm -rf "$PREFIX/setup-web"
+		install -d -m 0755 "$PREFIX/setup-web"
+		cp -a "$src/setup-web/." "$PREFIX/setup-web/"
+		note "$PREFIX/setup-web"
+	fi
+
 	local f
 	for f in "$src/bin/"*; do
 		[ -f "$f" ] || continue
