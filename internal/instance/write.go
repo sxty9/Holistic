@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -164,14 +165,42 @@ func render(v any) string {
 // The write is atomic. A half-written configuration is worse than none: it is
 // the file a service reads at its next start, and the next start is exactly
 // what a configuration change is followed by.
+// chown is a variable so a test can watch what Save asks for. The real one
+// needs root and would be a no-op in a test that runs as anybody else.
+var chown = os.Chown
+
 func (f *File) Save(mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(f.Path), 0o750); err != nil {
 		return err
 	}
+	// Who owns the file today. Save writes a NEW file and renames it over the
+	// old one, and a new file belongs to the process that created it — root.
+	// /etc/corex/config.json is root:corex 0640 and corex-api runs as corex;
+	// /etc/solisuite/config.json is root:solisuite and solisuite runs as
+	// solisuite. Losing the group takes both services off the air at their
+	// next restart, with "permission denied" on a file that is plainly there.
+	//
+	// It did, on 2026-08-30. The wizard rewrote both files, nothing looked
+	// wrong for two hours because each service had already read its config,
+	// and then the wizard's own restart step killed them.
+	uid, gid := -1, -1
+	if fi, err := os.Stat(f.Path); err == nil {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			uid, gid = int(st.Uid), int(st.Gid)
+		}
+	}
+
 	if old, err := os.ReadFile(f.Path); err == nil {
 		bak := fmt.Sprintf("%s.before-%s", f.Path, time.Now().UTC().Format("20060102T150405Z"))
 		if err := os.WriteFile(bak, old, mode); err != nil {
 			return fmt.Errorf("could not keep a copy of the previous %s: %w", f.Path, err)
+		}
+		// The copy carries the same ownership. A backup somebody has to become
+		// root to read is a backup that will not be read in the hour it is for.
+		if uid >= 0 {
+			if err := chown(bak, uid, gid); err != nil {
+				return fmt.Errorf("could not set the owner of %s: %w", bak, err)
+			}
 		}
 	}
 	b, err := json.MarshalIndent(f.tree, "", "  ")
@@ -181,6 +210,14 @@ func (f *File) Save(mode os.FileMode) error {
 	tmp := f.Path + ".incoming"
 	if err := os.WriteFile(tmp, append(b, '\n'), mode); err != nil {
 		return err
+	}
+	// Before the rename, so the file is never visible at its final path with
+	// the wrong owner.
+	if uid >= 0 {
+		if err := chown(tmp, uid, gid); err != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("could not give %s back the owner it had: %w", f.Path, err)
+		}
 	}
 	return os.Rename(tmp, f.Path)
 }

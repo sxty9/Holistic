@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -208,5 +209,97 @@ func TestWrittenFilesAreNotWorldReadable(t *testing.T) {
 	st, _ := os.Stat(p)
 	if st.Mode().Perm()&0o007 != 0 {
 		t.Errorf("configuration is world readable: %o", st.Mode().Perm())
+	}
+}
+
+// Save writes a new file and renames it over the old one, and a new file
+// belongs to the process that created it. On this machine that is root, while
+// /etc/corex/config.json is root:corex and corex-api runs as corex, and
+// /etc/solisuite/config.json is root:solisuite and solisuite runs as solisuite.
+//
+// Losing the group takes both services off the air at their next restart, with
+// "permission denied" on a file that is plainly there. It did, on 2026-08-30:
+// the wizard rewrote both files, nothing looked wrong for two hours because
+// each service had already read its config, and then the wizard's own restart
+// step killed them.
+func TestSaveGivesTheFileBackTheOwnerItHad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"a":1}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	type call struct {
+		path     string
+		uid, gid int
+	}
+	var calls []call
+	old := chown
+	chown = func(p string, uid, gid int) error {
+		calls = append(calls, call{p, uid, gid})
+		return nil
+	}
+	t.Cleanup(func() { chown = old })
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("no unix file owner on this platform")
+	}
+	wantUID, wantGID := int(st.Uid), int(st.Gid)
+
+	f, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Set("a", 2)
+	if err := f.Save(0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	var sawTemp, sawBackup bool
+	for _, c := range calls {
+		if c.uid != wantUID || c.gid != wantGID {
+			t.Errorf("%s was chowned to %d:%d, want %d:%d", c.path, c.uid, c.gid, wantUID, wantGID)
+		}
+		if strings.HasSuffix(c.path, ".incoming") {
+			sawTemp = true
+		}
+		if strings.Contains(c.path, ".before-") {
+			sawBackup = true
+		}
+	}
+	if !sawTemp {
+		t.Error("the new file was renamed into place without being given the old owner; " +
+			"the service that reads it by group loses access at its next restart")
+	}
+	if !sawBackup {
+		t.Error("the .before- copy kept root's ownership: a backup somebody has to become root " +
+			"to read is one that will not be read in the hour it is for")
+	}
+}
+
+// A file that did not exist has no owner to carry over, and asking to chown to
+// -1:-1 would be a bug of its own.
+func TestSaveDoesNotChownAFileItCreated(t *testing.T) {
+	dir := t.TempDir()
+	var calls int
+	old := chown
+	chown = func(string, int, int) error { calls++; return nil }
+	t.Cleanup(func() { chown = old })
+
+	f, err := Open(filepath.Join(dir, "new.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Set("a", 1)
+	if err := f.Save(0o640); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Errorf("a file with no previous owner was chowned %d time(s)", calls)
 	}
 }
