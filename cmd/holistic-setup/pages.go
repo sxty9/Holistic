@@ -161,3 +161,20 @@ func writeJSON(w http.ResponseWriter, v any) {
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
 }
+
+// pageNoCode is what an instance serves when it has neither a setup code nor a
+// seal. Its own paragraph explains the two ways to arrive here, because the
+// second one — a claim that was interrupted — looks alarming and is not.
+func pageNoCode() string {
+	var b strings.Builder
+	b.WriteString(`<h1>This machine is waiting for a setup code</h1>`)
+	b.WriteString(`<p class="lead">There is no setup code here, and setup has not finished. Nothing can be claimed until one exists.</p>`)
+	b.WriteString(`<p>On the machine itself:</p>`)
+	b.WriteString(`<pre>sudo holistic code</pre>`)
+	b.WriteString(`<p class="note">Two things lead here. A fresh install whose code was removed by hand —
+	   and a setup that was begun and interrupted: redeeming a code destroys it, and the record that
+	   setup finished is only written at the end. Minting a new one is the way back in either case,
+	   and it is safe: this page is served on your local network only, and the code is printed on the
+	   machine rather than sent anywhere.</p>`)
+	return page("Setup needs a code", b.String())
+}

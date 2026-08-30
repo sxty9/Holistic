@@ -334,3 +334,52 @@ func quoteJSON(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
 }
+
+// An instance with a spent code and no seal must stay up.
+//
+// Redeeming a code destroys it — correct, a spent code lying in /etc is a second
+// key to an open door — but the seal is only written when setup FINISHES. In
+// between, the instance is claimed and unsealed, which is the normal state for
+// as long as setup takes, and two of its steps wait on a registrar.
+//
+// newServer used to return an error there, so systemd restarted the daemon into
+// a loop: 398 restarts on the machine this was found on, the LAN listener gone,
+// and the only explanation in a journal nobody was reading.
+func TestAnInstanceWithNoCodeAndNoSealStaysUp(t *testing.T) {
+	dir := t.TempDir()
+	srv, err := newServer(
+		filepath.Join(dir, "setup.claim"), // never created: the code was spent
+		filepath.Join(dir, "provisioned.json"),
+		filepath.Join(dir, "claimed"), // never created: setup did not finish
+	)
+	if err != nil {
+		t.Fatalf("the daemon refused to start on a claimed, unsealed instance: %v", err)
+	}
+	if !srv.needsCode {
+		t.Fatal("it started, but does not know it has no code")
+	}
+
+	h := srv.routes()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "192.168.178.98"
+	req.RemoteAddr = "192.168.178.20:5000"
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("GET / answered %d, want 200 — the operator gets no explanation", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "holistic code") {
+		t.Error("the page does not name the command that gets back in")
+	}
+
+	// The gate must not be offered: a form with nothing behind it is worse than
+	// no form.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/claim/", nil)
+	req.Host = "192.168.178.98"
+	req.RemoteAddr = "192.168.178.20:5000"
+	h.ServeHTTP(rec, req)
+	if rec.Code != 404 {
+		t.Errorf("POST /claim/ answered %d, want 404 — it cannot work and should not exist", rec.Code)
+	}
+}

@@ -79,6 +79,9 @@ type server struct {
 	sealed   bool
 	sealAt   string
 	claimAt  string
+	// needsCode marks an instance with neither a code nor a seal: claimed and
+	// unsealed with its code spent, or one whose code was removed by hand.
+	needsCode bool
 	// webDir holds the built pages, or is empty. Empty is not a failure: the
 	// server-rendered pages below still claim an instance and still say what is
 	// happening. A release that shipped without the frontend should be poorer,
@@ -140,9 +143,25 @@ func newServerWith(claimAt, ledgerAt, sealAt string, p steps.Paths, m steps.Mach
 	g, err := claim.Load(claimAt)
 	if err != nil {
 		if errors.Is(err, claim.ErrNoCode) {
-			return nil, fmt.Errorf(
-				"there is no setup code at %s, so nobody could prove they installed this machine.\n"+
-					"Run the installer, or mint one on the machine itself.", claimAt)
+			// No code and no seal. This is not a reason to die, and dying here
+			// was measured doing real damage: redeeming a code destroys it —
+			// correctly, a spent code lying in /etc is a second key to an open
+			// door — but the seal is only written when setup FINISHES. Between
+			// those two moments the instance is claimed and unsealed, which is
+			// the normal state for as long as setup takes, and two of its steps
+			// wait on a registrar.
+			//
+			// Exiting there meant any restart in that window put the daemon
+			// into a loop: 398 restarts on the machine this was found on, the
+			// LAN listener gone, and the only explanation in a journal nobody
+			// was reading. That is the same shape as the nine-day outage this
+			// project spent a night diagnosing.
+			//
+			// So it stays up and says what to do. That reveals nothing: a page
+			// saying a setup code is needed tells an attacker what they could
+			// already infer from the gate.
+			s.needsCode = true
+			return s, nil
 		}
 		return nil, err
 	}
@@ -164,6 +183,14 @@ func (s *server) routes() http.Handler {
 		// the wrong way; a route that does not exist cannot be reached by a
 		// mistake nobody has made yet.
 		mux.HandleFunc("GET /{$}", s.status)
+		return lan.OnlyLocal(mux)
+	}
+
+	if s.needsCode {
+		// One route, and it is not the gate. Registering /claim here would
+		// offer a form with nothing behind it; a route that cannot work should
+		// not exist.
+		mux.HandleFunc("GET /{$}", s.noCode)
 		return lan.OnlyLocal(mux)
 	}
 
@@ -209,6 +236,13 @@ func usableWeb(dir string) string {
 		return ""
 	}
 	return dir
+}
+
+func (s *server) noCode(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Frame-Options", "DENY")
+	fmt.Fprint(w, pageNoCode())
 }
 
 func (s *server) page(w http.ResponseWriter, r *http.Request) {

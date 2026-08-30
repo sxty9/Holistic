@@ -65,13 +65,40 @@ func TestAClaimedInstanceWithAnUnreadableLedgerRefusesToServe(t *testing.T) {
 // An instance with no setup code cannot prove anybody installed it, so it must
 // not fall back to serving the wizard openly.
 func TestNoSetupCodeMeansNoSetup(t *testing.T) {
+	// This asserted that newServer returned an error — the mechanism, not the
+	// guarantee. The guarantee is that the wizard is not reachable without a
+	// code, and it still holds; what changed is that the daemon now stays up
+	// and says so instead of exiting.
+	//
+	// Exiting was doing real harm. Redeeming a code destroys it, and the seal
+	// is only written when setup finishes, so an instance mid-setup has neither
+	// — for as long as setup takes, and two of its steps wait on a registrar.
+	// Any restart in that window put the daemon in a loop: 398 restarts on the
+	// machine this was found on, with the LAN listener gone.
 	p := tmp(t)
-	_, err := newServer(p.claim, p.ledger, p.seal)
-	if err == nil {
-		t.Fatal("an instance with no setup code served the wizard")
+	srv, err := newServer(p.claim, p.ledger, p.seal)
+	if err != nil {
+		t.Fatalf("the daemon refused to start with no code: %v", err)
 	}
-	if !strings.Contains(err.Error(), "no setup code") {
-		t.Errorf("unhelpful refusal: %v", err)
+	if !srv.needsCode {
+		t.Fatal("it started without knowing it has no code")
+	}
+
+	h := srv.routes()
+	for _, probe := range []struct{ method, path string }{
+		{"POST", "/claim/"},
+		{"GET", "/api/state/"},
+		{"POST", "/api/step/domain/run"},
+	} {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(probe.method, probe.path, nil)
+		r.Host = "192.168.178.98"
+		r.RemoteAddr = "192.168.178.42:50000"
+		h.ServeHTTP(rec, r)
+		if rec.Code != 404 {
+			t.Errorf("%s %s answered %d with no setup code present, want 404",
+				probe.method, probe.path, rec.Code)
+		}
 	}
 }
 
