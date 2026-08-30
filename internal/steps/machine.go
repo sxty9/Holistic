@@ -84,10 +84,22 @@ func (systemd) Disable(unit string) error {
 }
 
 func (systemd) StopSoon(unit string) error {
-	// --no-block: systemd queues the job and systemctl returns at once. Without
-	// it, stopping the unit this process belongs to kills the process before
-	// systemctl can report, and the caller reads its own death as an error.
-	out, err := exec.Command("systemctl", "--no-block", "stop", unit).CombinedOutput()
+	// systemd-run, not systemctl.
+	//
+	// `systemctl --no-block stop` was tried first and died the same way as
+	// `disable --now`: systemctl is a child of the unit being stopped, so it
+	// sits in that unit's control group and KillMode=control-group takes it
+	// with the unit. The stop worked and systemctl was killed reporting it —
+	// "signal: terminated" for a stop that had happened. Measured live on
+	// 2026-08-30: the unit came back disabled and inactive, port 80 free, and
+	// the step said the listener was still up.
+	//
+	// systemd-run puts the stop in a transient unit of its own, outside this
+	// control group, so nothing that happens to this process reaches it.
+	// --collect so the transient unit does not linger after it exits.
+	out, err := exec.Command("systemd-run", "--no-block", "--collect",
+		"--unit=holistic-stop-"+strings.TrimSuffix(unit, ".service"),
+		"systemctl", "stop", unit).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s was asked to stop and systemd refused: %v\n%s",
 			unit, err, strings.TrimSpace(string(out)))
