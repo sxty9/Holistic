@@ -1624,3 +1624,78 @@ func TestAHostnameCloudflareCannotReachStopsTheProbe(t *testing.T) {
 		t.Errorf("the failure does not name the hostname that did not answer: %q", row.Detail)
 	}
 }
+
+// proven() derived its answer from instance.appOrigins — the very field it is
+// used to compute. An instance starting from an empty map could never fill it:
+// an app counted as proven only if its origin was already written, and an
+// origin was written only for a proven app.
+//
+// Seen live on 2026-08-30: nonce-probe passed on ten hostnames and appOrigins
+// stayed {}. coreX advertises those origins to the launcher, so the launcher
+// would have offered nothing at all.
+func TestTheProbeIsWhatFillsTheOriginMap(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+	k.standIn("cert-wait")
+
+	if got := atString(readTree2(t, k.p.CoreXConfig), "instance.appOrigins"); got != "" {
+		t.Logf("appOrigins before the probe: %q", got)
+	}
+	k.mustPass("nonce-probe")
+	k.mustPass("corex-restart-2")
+
+	tree := readTree2(t, k.p.CoreXConfig)
+	origins, ok := at(tree, "instance.appOrigins").(map[string]any)
+	if !ok || len(origins) == 0 {
+		t.Fatalf("appOrigins is %v after a probe that passed; the launcher offers nothing", at(tree, "instance.appOrigins"))
+	}
+	want := "https://" + k.e.catalogue().Hostname("gallery")
+	if origins["gallery"] != want {
+		t.Errorf("appOrigins[gallery] = %v, want %q", origins["gallery"], want)
+	}
+	// Standalone apps are not coreX origins: RoomSense has its own server and
+	// the mail intake is not something the launcher opens.
+	for _, id := range []string{"roomsense", "routedge", "ssh"} {
+		if _, in := origins[id]; in {
+			t.Errorf("%s reached appOrigins; coreX serves no API for it and the launcher cannot open it", id)
+		}
+	}
+}
+
+// A partial pass writes the origins for what did answer. All-or-nothing would
+// leave a launcher offering nothing because one hostname was slow.
+func TestAPartialProbeStillWritesWhatWasProven(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+	k.standIn("cert-wait")
+
+	dead := k.e.catalogue().Hostname("mail")
+	k.respFor = func(url string) (Response, error) {
+		if strings.Contains(url, dead) {
+			return Response{Status: 502}, nil
+		}
+		return Response{Status: 200, Body: "<!doctype html>"}, nil
+	}
+	if row := k.run("nonce-probe"); row.Status == ledger.Passed {
+		t.Fatal("a 502 hostname was accepted")
+	}
+	k.standIn("nonce-probe")
+	k.mustPass("corex-restart-2")
+
+	origins, _ := at(readTree2(t, k.p.CoreXConfig), "instance.appOrigins").(map[string]any)
+	if _, in := origins["gallery"]; !in {
+		t.Errorf("gallery answered and got no origin: %v", origins)
+	}
+	if _, in := origins["mail"]; in {
+		t.Errorf("mail answered 502 and got an origin anyway: %v", origins)
+	}
+}
+
+func readTree2(t *testing.T, path string) map[string]any {
+	t.Helper()
+	tree, _, err := readTree(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tree
+}

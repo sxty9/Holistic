@@ -491,6 +491,11 @@ func stepNonceProbe() Step {
 			cat := e.catalogue()
 			var proof strings.Builder
 			var bad []string
+			answered := map[string]bool{}
+			byHost := map[string]string{}
+			for _, a := range cat.Enabled() {
+				byHost[cat.Hostname(a.ID)] = a.ID
+			}
 			for _, h := range cat.WebHostnames() {
 				nonce := fmt.Sprintf("%d-%d", e.now().UnixNano(), len(proof.String()))
 				res, err := e.fetch(context.Background(), "https://"+h+"/?holistic-probe="+nonce)
@@ -513,9 +518,14 @@ func stepNonceProbe() Step {
 					bad = append(bad, fmt.Sprintf("%s: %d — Cloudflare could not reach the service behind it", h, res.Status))
 					continue
 				}
+				answered[byHost[h]] = true
 				fmt.Fprintf(&proof, "%s -> %d (probe %s, via %s)\n",
 					h, res.Status, nonce, firstNonEmpty(res.Header.Get("cf-ray"), "no cf-ray"))
 			}
+			// Recorded even when some hostnames did not answer: an origin is
+			// written per app that was proven, not all-or-nothing, and a
+			// partial pass is a launcher offering what actually works.
+			e.given.proven = answered
 			if len(bad) > 0 {
 				return waitingOnThem("not answering from the public internet yet: " + strings.Join(bad, "; "))
 			}

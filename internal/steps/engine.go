@@ -63,7 +63,17 @@ type given struct {
 	// apps is an overlay on the catalogue defaults rather than a replacement,
 	// so an answer that mentions three apps does not silently turn off the
 	// five it did not mention.
-	apps   map[string]bool
+	apps map[string]bool
+	// proven is the app ids whose hostname answered a request from the public
+	// internet during nonce-probe, in this process.
+	//
+	// It has to be kept somewhere. proven() used to derive the set from
+	// instance.appOrigins alone — the very field it is used to compute — so an
+	// instance starting from an empty map could never fill it: an app counted
+	// as proven only if its origin was already written, and an origin was
+	// written only for a proven app. The probe passed on ten hostnames and
+	// appOrigins stayed {}, which is a launcher offering nothing.
+	proven map[string]bool
 	planOK bool
 	sealOK bool
 }
@@ -358,6 +368,11 @@ func (e *Engine) proven() map[string]bool {
 	origins, ok := at(tree, "instance.appOrigins").(map[string]any)
 	if !ok {
 		return out
+	}
+	// What this process measured, first. The config is the memory of earlier
+	// runs; the probe is the evidence from this one.
+	for id := range e.given.proven {
+		out[id] = true
 	}
 	for id, v := range origins {
 		s, ok := v.(string)

@@ -1131,6 +1131,23 @@ func stepCoreXRestart2() Step {
 			if d == "" {
 				return blocked("waiting on the domain")
 			}
+			// The origins, now that the hostnames have been proven. Written
+			// here and not in the apps step, which runs long before anything
+			// has answered: an origin map listing hostnames that do not
+			// resolve is the populated-but-wrong state that shipped once
+			// already. Before the restart, so the restart is what picks it up.
+			core, err := openEdit(e.paths.CoreXConfig, confMode)
+			if err != nil {
+				return failed(err.Error())
+			}
+			origins := e.catalogue().CoreXOrigins(e.proven())
+			core.set("instance.appOrigins", origins)
+			if len(core.changes()) > 0 {
+				if err := applyAll([]*edit{core}); err != nil {
+					return failed(err.Error())
+				}
+			}
+
 			if err := e.machine.Restart(e.paths.CoreXUnit); err != nil {
 				return failed(err.Error())
 			}
