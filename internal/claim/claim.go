@@ -135,9 +135,23 @@ func Normalise(s string) string {
 	return b.String()
 }
 
-// Guard holds the code for the lifetime of one setup process.
+// Guard holds the code, and re-reads it from disk before every attempt.
+//
+// It used to hold it for the lifetime of the process, and that made a promise
+// false. `holistic code` writes a fresh code and prints "the previous code no
+// longer works" — but it does not restart this daemon, so the running process
+// went on accepting the old one. Measured on 2026-08-30: a code minted at
+// 11:20, and the code it replaced still redeemed successfully afterwards. Anyone
+// who believed their code had leaked, minted a new one, and was told the old one
+// was dead, was told something untrue.
+//
+// The file is the truth; this is a cache of it. A code that changed on disk is a
+// different secret, so the attempt count starts again with it — the old lockout
+// was against a code that no longer exists. A file that is GONE is not an open
+// door: it means the code was spent, and nothing is accepted after that.
 type Guard struct {
 	mu       sync.Mutex
+	path     string
 	code     string
 	born     time.Time
 	attempts int
@@ -165,7 +179,7 @@ func Load(path string) (*Guard, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Guard{code: code, born: st.ModTime(), now: time.Now}, nil
+	return &Guard{path: path, code: code, born: st.ModTime(), now: time.Now}, nil
 }
 
 // New builds a guard directly, for tests and for a process that has just minted.
@@ -188,6 +202,9 @@ func (g *Guard) Redeem(typed string) error {
 
 	if g.redeemed {
 		return ErrAlreadyRun
+	}
+	if err := g.reread(); err != nil {
+		return err
 	}
 	if g.attempts >= MaxAttempts {
 		return ErrLockedOut
@@ -220,6 +237,34 @@ func (g *Guard) Attempts() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.attempts
+}
+
+// reread picks up a code minted since this process started. Caller holds the
+// lock.
+func (g *Guard) reread() error {
+	if g.path == "" {
+		return nil // constructed without a file; tests and nothing else
+	}
+	b, err := os.ReadFile(g.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// Spent, or removed by hand. Either way there is no code to offer,
+			// and answering "wrong code" rather than "no code" would be a lie
+			// that also invites guessing.
+			return ErrAlreadyRun
+		}
+		return err
+	}
+	fresh := Normalise(string(b))
+	if fresh == "" || fresh == g.code {
+		return nil
+	}
+	st, err := os.Stat(g.path)
+	if err != nil {
+		return err
+	}
+	g.code, g.born, g.attempts = fresh, st.ModTime(), 0
+	return nil
 }
 
 func (g *Guard) Redeemed() bool {

@@ -735,6 +735,29 @@ main() {
 	[ "$DRY" -eq 0 ] && require_root
 	check_paths
 
+	# The code is minted BEFORE the unit starts, not after.
+	#
+	# It used to be the last thing main() did, after install_release had already
+	# run `systemctl enable --now`. So on every fresh install the daemon came up,
+	# found no setup.claim, refused to serve — correctly, because without a code
+	# nobody could prove they installed the machine — and exited 1. systemd
+	# restarted it five seconds later, by which time the code existed, so it
+	# self-healed and nobody noticed.
+	#
+	# What it left behind: a failed start in the journal of every clean install,
+	# and a five-second window with no setup listener at all. It self-heals only
+	# because Restart=on-failure has no burst limit here; give it one, or make
+	# RestartSec longer, and a fresh install would simply be down.
+	local code=''
+	if [ "$DRY" -eq 0 ]; then
+		if [ -s "$CONF/setup.claim" ]; then
+			code="$(cat "$CONF/setup.claim")"
+		else
+			code="$(mint_code)"
+			write_code "$code"
+		fi
+	fi
+
 	local plat ver dir
 	plat="$(platform)"
 	ver="$(resolve_version)"
@@ -754,17 +777,6 @@ main() {
 	fi
 
 	publish_name
-
-	local code
-	if [ -s "$CONF/setup.claim" ]; then
-		step "Setup code"
-		say "   One already exists and has not been used."
-		code="$(cat "$CONF/setup.claim")"
-	else
-		code="$(mint_code)"
-		write_code "$code"
-	fi
-
 	print_where "$code"
 }
 

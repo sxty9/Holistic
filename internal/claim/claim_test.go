@@ -153,3 +153,92 @@ func TestDestroyIsIdempotent(t *testing.T) {
 		t.Error("the code is still on disk after being destroyed")
 	}
 }
+
+// `holistic code` writes a fresh code and prints "the previous code no longer
+// works". It does not restart the daemon, so before this the running process
+// went on accepting the old one — measured on a real install, where a code
+// minted at 11:20 did not stop its predecessor redeeming afterwards. The file is
+// the truth; the guard is a cache of it.
+func TestAFreshCodeOnDiskRetiresTheOneInMemory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "setup.claim")
+	first, err := Mint(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Somebody mints a new one. The daemon is not restarted.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Mint(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("two mints produced the same code")
+	}
+
+	if err := g.Redeem(first); !errors.Is(err, ErrWrongCode) {
+		t.Errorf("the retired code was answered with %v, want ErrWrongCode — it still works", err)
+	}
+	if err := g.Redeem(second); err != nil {
+		t.Errorf("the code that is actually on disk was refused: %v", err)
+	}
+}
+
+// A new code is a new secret, so the lockout that was counted against the old
+// one does not carry over. Otherwise somebody who fat-fingered five times could
+// not recover by minting a fresh code, which is exactly what the message tells
+// them to do.
+func TestAFreshCodeClearsTheLockout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "setup.claim")
+	if _, err := Mint(path); err != nil {
+		t.Fatal(err)
+	}
+	g, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < MaxAttempts; i++ {
+		_ = g.Redeem("not-the-code")
+	}
+	if err := g.Redeem("still-not"); !errors.Is(err, ErrLockedOut) {
+		t.Fatalf("expected a lockout after %d attempts, got %v", MaxAttempts, err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := Mint(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Redeem(fresh); err != nil {
+		t.Errorf("a freshly minted code was refused because of the old one's lockout: %v", err)
+	}
+}
+
+// A spent code leaves no file. That must not read as "no code required".
+func TestAMissingFileIsNotAnOpenDoor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "setup.claim")
+	code, err := Mint(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	for _, try := range []string{code, "", "anything"} {
+		if err := g.Redeem(try); err == nil {
+			t.Errorf("%q was accepted with no code file present", try)
+		}
+	}
+}
