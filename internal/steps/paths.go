@@ -92,7 +92,13 @@ func DefaultPaths() Paths {
 		Seal:          "/etc/holistic/claimed",
 		Claim:         "/etc/holistic/setup.claim",
 		SetupUnit:     "holistic-setup.service",
-		Corexctl:      "corexctl",
-		DataDir:       "/var/lib/corex",
+		// Absolute, like WarpgateBin beside it. This was a bare "corexctl" and
+		// the admin step failed on the running machine with `exec: "corexctl":
+		// executable file not found in $PATH` — holistic-setup.service is a
+		// systemd unit, and a unit's PATH does not include /opt/holistic/bin.
+		// The two fields describe the same kind of thing and only one of them
+		// had been given a path.
+		Corexctl: "/opt/holistic/bin/corexctl",
+		DataDir:  "/var/lib/corex",
 	}
 }
