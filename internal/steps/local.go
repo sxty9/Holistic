@@ -465,7 +465,23 @@ func appsConflict(e *Engine, c catalogue.Catalogue, warp, soli, core *edit) *res
 	if e.ours("apps") {
 		return nil
 	}
-	var foreign []string
+	// Two different findings, and they had one report between them.
+	//
+	// `foreign` is a name belonging to some other domain: another instance owns
+	// it, and "this is the wrong machine" is the right thing to say.
+	//
+	// `ours` is a name under THIS domain that does not match what the catalogue
+	// would write. Nobody else owns it — this instance published it, earlier,
+	// differently. Telling somebody that is the wrong machine, about the right
+	// machine, is worse than saying nothing.
+	//
+	// The apex used to be reported as foreign, because henrysoase.org does not
+	// end in ".henrysoase.org". Seen live on 2026-08-30: a running instance was
+	// told its own apex belonged to somebody else.
+	var foreign, mine []string
+	within := func(host string) bool {
+		return host == c.Domain || strings.HasSuffix(host, "."+c.Domain)
+	}
 	if arr, ok := soli.was("apps").([]any); ok {
 		for _, item := range arr {
 			m, ok := item.(map[string]any)
@@ -473,33 +489,59 @@ func appsConflict(e *Engine, c catalogue.Catalogue, warp, soli, core *edit) *res
 				continue
 			}
 			host, _ := m["host"].(string)
-			if host != "" && !strings.HasSuffix(host, "."+c.Domain) {
+			switch {
+			case host == "":
+			case !within(host):
 				foreign = append(foreign, host)
+			default:
+				mine = append(mine, host)
 			}
 		}
 	}
 	if m, ok := core.was("instance.appOrigins").(map[string]any); ok {
 		for id, v := range m {
 			s, _ := v.(string)
-			if s != "" && s != c.Origin(id) {
+			if s == "" || s == c.Origin(id) {
+				continue
+			}
+			if h := strings.TrimPrefix(strings.TrimPrefix(s, "https://"), "http://"); within(h) {
+				mine = append(mine, s)
+			} else {
 				foreign = append(foreign, s)
 			}
 		}
 	}
-	if len(foreign) == 0 {
+	if len(foreign) == 0 && len(mine) == 0 {
 		return nil
 	}
 	sort.Strings(foreign)
+	sort.Strings(mine)
+
+	if len(foreign) > 0 {
+		return conflictPtr(Conflict{
+			Object:    "the app list in " + e.paths.SolisuiteConfig + " and " + e.paths.CoreXConfig,
+			Found:     quote(foreign),
+			FoundNote: "hostnames under a domain that is not " + c.Domain + ", and this step has never run here",
+			Desired:   quote(c.Hostnames()),
+			Why: "Solisuite maps a Host header to an app from this list and coreX advertises these origins to the launcher. " +
+				"Two instances cannot both own them, and replacing them would take an already-working instance off the air.",
+			Resolution: "If this machine is being moved to " + c.Domain + ", clear the old app lists deliberately and run this " +
+				"step again. If it is not, this is the wrong machine.",
+			Consequence: "Nothing this instance publishes is live yet. The instance those hostnames belong to is untouched.",
+		})
+	}
 	return conflictPtr(Conflict{
 		Object:    "the app list in " + e.paths.SolisuiteConfig + " and " + e.paths.CoreXConfig,
-		Found:     quote(foreign),
-		FoundNote: "hostnames under a domain that is not " + c.Domain + ", and this step has never run here",
+		Found:     quote(mine),
+		FoundNote: "already published by this instance, under " + c.Domain + ", and not what this catalogue would write",
 		Desired:   quote(c.Hostnames()),
-		Why: "Solisuite maps a Host header to an app from this list and coreX advertises these origins to the launcher. " +
-			"Two instances cannot both own them, and replacing them would take an already-working instance off the air.",
-		Resolution: "If this machine is being moved to " + c.Domain + ", clear the old app lists deliberately and run this " +
-			"step again. If it is not, this is the wrong machine.",
-		Consequence: "Nothing this instance publishes is live yet. The instance those hostnames belong to is untouched.",
+		Why: "These are yours and they are serving now. Solisuite maps a Host header to an app from this list, so " +
+			"replacing it changes what answers on names that already answer — including, if the list shrinks, names " +
+			"that would then answer with nothing.",
+		Resolution: "Compare the two lists above. If the new one is what you want, clear " + e.paths.SolisuiteConfig +
+			" apps[] and " + e.paths.CoreXConfig + " instance.appOrigins deliberately, then run this step again.\n\n" +
+			"Both files are rewritten atomically with a .before-* copy beside them, so the old list is recoverable.",
+		Consequence: "The apps you chose are not published yet. What is already published keeps working.",
 	})
 }
 

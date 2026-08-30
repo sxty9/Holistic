@@ -1215,3 +1215,63 @@ func TestAWiderTokenPassesAndIsNamedAsWider(t *testing.T) {
 		}
 	}
 }
+
+// A running instance was told its own apex belonged to somebody else.
+//
+// The check was `!strings.HasSuffix(host, "."+domain)`, and example.org does not
+// end in ".example.org" — so the apex, the one hostname every instance has,
+// read as foreign, and the report ended "if it is not, this is the wrong
+// machine". Seen live on 2026-08-30 against this machine's own configuration.
+//
+// The two findings had one report between them and needed two: a name under
+// somebody else's domain, and a name under this one that this instance
+// published earlier and differently.
+func TestOurOwnHostnamesAreNotCalledSomebodyElses(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	writeJSONFile(k.t, k.p.SolisuiteConfig, map[string]any{
+		"apps": []any{
+			map[string]any{"id": "launcher", "host": testDomain, "origin": "https://" + testDomain},
+		},
+	})
+	row := k.run("apps")
+
+	if row.Status != ledger.Conflict {
+		t.Fatalf("an existing app list was overwritten instead of held: %s %s", row.Status, row.Detail)
+	}
+	c := row.Conflict
+	if c == nil {
+		t.Fatal("a conflict with no report")
+	}
+	if strings.Contains(c.Resolution, "wrong machine") {
+		t.Errorf("the right machine was called the wrong one:\n  found: %s\n  %s", c.Found, c.Resolution)
+	}
+	if strings.Contains(c.FoundNote, "is not "+testDomain) {
+		t.Errorf("this instance's own apex was reported as belonging to another domain: %q", c.FoundNote)
+	}
+	if !strings.Contains(c.FoundNote, "this instance") {
+		t.Errorf("the report does not say whose these are: %q", c.FoundNote)
+	}
+	if !strings.Contains(c.Found, testDomain) {
+		t.Errorf("the report does not quote what it found: %q", c.Found)
+	}
+}
+
+// And a name that really does belong elsewhere still gets the harder sentence.
+func TestAHostnameUnderAnotherDomainStillSaysWrongMachine(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	writeJSONFile(k.t, k.p.SolisuiteConfig, map[string]any{
+		"apps": []any{map[string]any{"id": "mail", "host": "mail.someone-else.invalid"}},
+	})
+	row := k.run("apps")
+	if row.Status != ledger.Conflict {
+		t.Fatalf("another instance's hostnames were overwritten: %s", row.Status)
+	}
+	c := row.Conflict
+	if c == nil || !strings.Contains(c.Resolution, "wrong machine") {
+		t.Errorf("a foreign hostname did not get the wrong-machine sentence: %+v", c)
+	}
+}
