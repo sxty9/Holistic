@@ -179,3 +179,50 @@ func TestTheDomainIsNormalisedOnce(t *testing.T) {
 		t.Errorf("hostname is %q", c.Hostname("mail"))
 	}
 }
+
+// Inbound mail arrives at routedge and nowhere else. A catalogue without it
+// produces an instance whose setup completed and whose mail silently never
+// comes — which is the failure this project was started over, rebuilt.
+//
+// It was genuinely missing until 2026-08-30, and it was found by running the
+// wizard against a machine that already had the entry: the reconciler refused
+// to publish a list that would have deleted it. On a fresh machine there would
+// have been no conflict and no entry.
+func TestTheCatalogueCarriesTheMailIntake(t *testing.T) {
+	var found *App
+	for i := range Default() {
+		if Default()[i].ID == "routedge" {
+			a := Default()[i]
+			found = &a
+		}
+	}
+	if found == nil {
+		t.Fatal("no routedge in the catalogue: an instance built from it receives no mail")
+	}
+	if !found.Required {
+		t.Error("routedge is not Required, so somebody can uncheck inbound mail without being told")
+	}
+	if !found.Enabled {
+		t.Error("routedge is not Enabled by default; a fresh instance would start with no mail intake")
+	}
+	if !found.Standalone {
+		t.Error("routedge is not Standalone, so Solisuite would be asked to serve a document it does not have")
+	}
+
+	// It has to reach DNS and ingress, and must not reach Solisuite's app list.
+	c := New("example.org", Default())
+	var inWarpgate bool
+	for _, w := range c.Warpgate() {
+		if w.Name == "routedge" {
+			inWarpgate = true
+		}
+	}
+	if !inWarpgate {
+		t.Error("routedge is not in the Warpgate projection, so no hostname is published for it")
+	}
+	for _, s := range c.Solisuite() {
+		if s.ID == "routedge" {
+			t.Error("routedge reached Solisuite's app list, which would map its Host to a document that does not exist")
+		}
+	}
+}

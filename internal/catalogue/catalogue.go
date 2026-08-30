@@ -74,6 +74,19 @@ func Default() []App {
 			Note: "Administration. Visible to administrators only."},
 		{ID: "roomsense", Label: "RoomSense", Upstream: roomsense, Enabled: false, Standalone: true,
 			Note: "Its own service, not part of Solisuite."},
+		// Not an app anybody opens. It is where Cloudflare Email Routing hands
+		// incoming mail to this instance, and without a hostname published for
+		// it there is no inbound mail at all.
+		//
+		// It was missing, and the way it was found is the argument for Required
+		// existing: running the wizard against this machine produced a conflict
+		// because Warpgate's live configuration already had a routedge entry the
+		// catalogue had never heard of, and publishing the catalogue would have
+		// deleted it. On a fresh machine there would have been no conflict and
+		// no entry — a completed setup with mail that silently never arrives,
+		// which is the exact failure this whole project was started over.
+		{ID: "routedge", Label: "Mail intake", Upstream: routedge, Enabled: true, Standalone: true, Required: true,
+			Note: "Where incoming mail arrives. Nobody opens it; without it, nothing arrives."},
 	}
 }
 
@@ -83,6 +96,7 @@ func Default() []App {
 const (
 	solisuite = "http://127.0.0.1:8795"
 	roomsense = "http://127.0.0.1:8797"
+	routedge  = "http://127.0.0.1:8793"
 )
 
 // Catalogue is the decision, plus the domain it is expressed under.
