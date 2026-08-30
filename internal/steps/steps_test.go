@@ -156,15 +156,16 @@ func (r *recorder) unitCalls() []string {
 }
 
 type kit struct {
-	t    *testing.T
-	e    *Engine
-	led  *ledger.Ledger
-	p    Paths
-	m    *recorder
-	cf   *fakeCF
-	etc  string
-	resp Response
-	ferr error
+	t       *testing.T
+	e       *Engine
+	led     *ledger.Ledger
+	p       Paths
+	m       *recorder
+	cf      *fakeCF
+	etc     string
+	resp    Response
+	ferr    error
+	respFor func(url string) (Response, error)
 }
 
 // example.org and .invalid throughout, and every path under t.TempDir(). A test
@@ -209,6 +210,12 @@ func newKit(t *testing.T) *kit {
 	// can reach the internet is a test whose result depends on somebody else's
 	// uptime.
 	k.e = NewWith(led, p, k.m, func(ctx context.Context, url string) (Response, error) {
+		// respFor lets a test answer differently per hostname, which is what
+		// the nonce probe is about: the services behind these names do not all
+		// answer "/" the same way, and one of them answers 404 on purpose.
+		if k.respFor != nil {
+			return k.respFor(url)
+		}
 		return k.resp, k.ferr
 	}, k.cf)
 	return k
@@ -1554,5 +1561,66 @@ func TestTheConfirmationScreenSaysWhatIsAlreadyThere(t *testing.T) {
 	if !seenRemoval {
 		t.Error("a record this instance published and no longer wants is not on the screen; " +
 			"a deletion is the one thing here nobody may miss")
+	}
+}
+
+// The probe demanded 2xx or 3xx from every hostname, and routedge — the mail
+// intake — answers 404 at "/" on purpose: its public surface is /inbound and
+// nothing else. So the wizard stopped one step from the end on a hostname that
+// was working exactly as designed.
+//
+// A 4xx has to come from the service. Cloudflare does not invent one for a
+// tunnel that is down; it answers 502 or 52x. So a 404 proves the whole path
+// from the public internet through Cloudflare and the tunnel worked.
+func TestAServiceThatAnswers404IsStillReachable(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.answer("apps", []appChoice{{ID: "gallery", On: true}})
+	k.mustPass("apps")
+	k.standIn("cert-wait")
+
+	intake := k.e.catalogue().Hostname("routedge")
+	k.respFor = func(url string) (Response, error) {
+		if strings.Contains(url, intake) {
+			return Response{Status: 404, Body: "not found"}, nil
+		}
+		return Response{Status: 200, Body: "<!doctype html>"}, nil
+	}
+	row := k.run("nonce-probe")
+	if row.Status != ledger.Passed {
+		t.Fatalf("a service answering 404 at / was called unreachable: %s %s", row.Status, row.Detail)
+	}
+	if !strings.Contains(row.Proof, "404") {
+		t.Errorf("the proof hides that a hostname answered 404: %q", row.Proof)
+	}
+	if !strings.Contains(row.Proof, "does NOT prove which service") {
+		t.Errorf("the proof claims more than it measured: %q", row.Proof)
+	}
+}
+
+// And a hostname Cloudflare cannot reach still stops it. 502 is what a tunnel
+// with no connector produces, which is the failure this step exists to catch.
+func TestAHostnameCloudflareCannotReachStopsTheProbe(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.answer("apps", []appChoice{{ID: "gallery", On: true}})
+	k.mustPass("apps")
+	k.standIn("cert-wait")
+
+	dead := k.e.catalogue().Hostname("gallery")
+	k.respFor = func(url string) (Response, error) {
+		if strings.Contains(url, dead) {
+			return Response{Status: 502, Body: "Bad gateway"}, nil
+		}
+		return Response{Status: 200, Body: "<!doctype html>"}, nil
+	}
+	row := k.run("nonce-probe")
+	if row.Status == ledger.Passed {
+		t.Fatalf("a hostname answering 502 was accepted: %s", row.Detail)
+	}
+	if !strings.Contains(row.Detail, dead) {
+		t.Errorf("the failure does not name the hostname that did not answer: %q", row.Detail)
 	}
 }

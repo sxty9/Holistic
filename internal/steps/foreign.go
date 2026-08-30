@@ -498,8 +498,19 @@ func stepNonceProbe() Step {
 					bad = append(bad, h+": "+err.Error())
 					continue
 				}
-				if res.Status < 200 || res.Status >= 400 {
-					bad = append(bad, fmt.Sprintf("%s: %d", h, res.Status))
+				// 5xx only. A 4xx has to come from the origin — Cloudflare
+				// does not invent one for a tunnel that is down; it answers
+				// 502 or 52x. So a 404 proves the whole path worked and the
+				// service simply has nothing at "/", which is the correct
+				// answer from the mail intake: its public surface is /inbound
+				// and nothing else, and /queue and /outbound are 404 on
+				// purpose.
+				//
+				// This demanded 2xx or 3xx and failed on routedge's 404 —
+				// holding the wizard one step from the end on a hostname that
+				// was working exactly as designed.
+				if res.Status >= 500 {
+					bad = append(bad, fmt.Sprintf("%s: %d — Cloudflare could not reach the service behind it", h, res.Status))
 					continue
 				}
 				fmt.Fprintf(&proof, "%s -> %d (probe %s, via %s)\n",
@@ -508,7 +519,11 @@ func stepNonceProbe() Step {
 			if len(bad) > 0 {
 				return waitingOnThem("not answering from the public internet yet: " + strings.Join(bad, "; "))
 			}
-			return passed(fmt.Sprintf("%d hostname(s) answered from outside", len(cat.WebHostnames())), proof.String())
+			return passed(fmt.Sprintf("%d hostname(s) answered from outside", len(cat.WebHostnames())),
+				proof.String()+
+					"\nEach line is one request from the public internet through Cloudflare and the tunnel to a "+
+					"local service. A 4xx counts: it comes from the service, which is what was being proven. "+
+					"It does NOT prove which service answered — nothing echoes the probe value back.")
 		},
 	}
 }
