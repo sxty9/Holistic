@@ -19,7 +19,11 @@ type Engine struct {
 	paths   Paths
 	machine Machine
 	fetch   Fetch
-	now     func() time.Time
+	// cf reads from Cloudflare and cannot write to it. See cloudflare.go: every
+	// write in this wizard runs `warpgate`, which is where the ownership marker
+	// and the conflict path live.
+	cf  Cloudflare
+	now func() time.Time
 
 	order []*Step
 	byID  map[string]*Step
@@ -44,8 +48,12 @@ type Engine struct {
 type given struct {
 	domain      string
 	displayName string
-	dataDir     string
-	engine      string
+	// zone is what Cloudflare answered about the domain, kept so the steps
+	// after zone-resolve do not each ask again — and so a re-run of a later
+	// step does not depend on the network being up.
+	zone    Zone
+	dataDir string
+	engine  string
 	// apps is an overlay on the catalogue defaults rather than a replacement,
 	// so an answer that mentions three apps does not silently turn off the
 	// five it did not mention.
@@ -60,11 +68,18 @@ type given struct {
 // process — so the wizard's idea of what has been decided has to come from what
 // is on disk, not from what somebody typed into a form that no longer exists.
 func New(led *ledger.Ledger, p Paths, m Machine, f Fetch) *Engine {
+	return NewWith(led, p, m, f, LiveCloudflare(20*time.Second))
+}
+
+// NewWith takes the Cloudflare seam too, so a test can run every provider step
+// without a credential and without a network.
+func NewWith(led *ledger.Ledger, p Paths, m Machine, f Fetch, cf Cloudflare) *Engine {
 	e := &Engine{
 		led:       led,
 		paths:     p,
 		machine:   m,
 		fetch:     f,
+		cf:        cf,
 		now:       time.Now,
 		byID:      map[string]*Step{},
 		secrets:   map[string]string{},

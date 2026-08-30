@@ -227,3 +227,57 @@ func TestUnreadableAnswersAreAnError(t *testing.T) {
 		t.Fatal("an unparseable answer was treated as a verdict")
 	}
 }
+
+// The zone's own permissions array is what a correctly scoped token can be
+// judged by. These are the exact strings the live zone returned on 2026-08-30
+// for the token this instance uses.
+func TestJudgeZoneReadsTheEffectiveGrant(t *testing.T) {
+	live := []string{"#dns_records:edit", "#dns_records:read", "#zone:read"}
+
+	v := JudgeZone(true, live, Setup())
+	if v.OK() {
+		t.Fatal("the setup credential was judged complete; it carries neither zone_settings:edit nor email_routing_rule:edit")
+	}
+	var missing []string
+	for _, p := range v.Missing {
+		missing = append(missing, p.Key+":"+p.Type)
+	}
+	want := []string{"zone_settings:edit", "email_routing_rule:edit"}
+	if len(missing) != len(want) {
+		t.Fatalf("missing = %v, want exactly %v", missing, want)
+	}
+	for i := range want {
+		if missing[i] != want[i] {
+			t.Errorf("missing[%d] = %s, want %s", i, missing[i], want[i])
+		}
+	}
+
+	// The runtime credential is DNS alone, and this token satisfies it. That is
+	// the check that says the mapping is right rather than merely strict: the
+	// form says "dns" and the zone says "dns_records", and getting that wrong
+	// would report a working token as broken.
+	if r := JudgeZone(true, live, Runtime()); !r.OK() {
+		t.Errorf("the runtime credential was judged incomplete against a token that carries dns_records:edit: %v", r.Missing)
+	}
+}
+
+// An edit is not satisfied by a read. Cloudflare lists both when it grants
+// edit, so the only way to see the difference is to ask for the exact pair.
+func TestJudgeZoneDoesNotAcceptReadForEdit(t *testing.T) {
+	readOnly := []string{"#dns_records:read", "#zone:read"}
+	v := JudgeZone(true, readOnly, Runtime())
+	if v.OK() {
+		t.Error("a read-only token satisfied a credential that needs to write DNS")
+	}
+}
+
+// An inactive token is not valid however well scoped it is.
+func TestJudgeZoneRefusesAnInactiveToken(t *testing.T) {
+	v := JudgeZone(false, []string{"#dns_records:edit", "#dns_records:read", "#zone:read"}, Runtime())
+	if v.OK() {
+		t.Error("an inactive token was accepted")
+	}
+	if len(v.Missing) != 0 {
+		t.Error("it also reported permissions missing, which confuses two different problems")
+	}
+}

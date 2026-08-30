@@ -33,6 +33,11 @@ type Paths struct {
 	// log line.
 	WarpgateToken string
 
+	// WarpgateBin is the command that plans and applies the edge. The wizard
+	// never writes DNS itself — see cloudflare.go — so this is how every
+	// provider write happens.
+	WarpgateBin string
+
 	CoreXUnit     string
 	SolisuiteUnit string
 	// ConnectorUnit is the tunnel connector. It is what warpgate-config pins as
@@ -62,12 +67,21 @@ func DefaultPaths() Paths {
 		SolisuiteConfig: "/etc/solisuite/config.json",
 		SolisuiteEnv:    "/etc/solisuite/solisuite.env",
 		WarpgateConfig:  "/etc/warpgate/config.json",
-		WarpgateIngress: "/etc/warpgate/ingress.json",
+		// .yml, not .json. Warpgate generates cloudflared's own ingress file
+		// and cloudflared reads YAML; the name here was a guess and the guess
+		// was wrong. Checked against the running machine on 2026-08-30.
+		WarpgateIngress: "/etc/warpgate/ingress.yml",
 		WarpgateToken:   "/etc/warpgate/cloudflare.token",
+		WarpgateBin:     "/opt/holistic/bin/warpgate",
 		CoreXUnit:       "corex-api.service",
 		SolisuiteUnit:   "solisuite.service",
-		ConnectorUnit:   "warpgate.service",
-		Corexctl:        "corexctl",
-		DataDir:         "/var/lib/corex",
+		// The connector's unit is cloudflared-warpgate, not warpgate: warpgate
+		// is the command that plans and applies, and the connector is
+		// cloudflared running against the ingress warpgate writes. Naming the
+		// wrong one meant every reload would have restarted nothing, and
+		// `is-active` would have answered about a unit that does not exist.
+		ConnectorUnit: "cloudflared-warpgate.service",
+		Corexctl:      "corexctl",
+		DataDir:       "/var/lib/corex",
 	}
 }

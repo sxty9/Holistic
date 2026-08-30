@@ -179,6 +179,19 @@ type tokenBody struct {
 
 // Judge compares a token's actual permissions against what was asked for.
 //
+// IT CANNOT BE REACHED WITH A CORRECTLY SCOPED TOKEN, and that is measured
+// rather than suspected. GET /user/tokens/verify returns {id, status} and
+// nothing else — no policies, no permission groups. Reading a token's own
+// definition needs GET /user/tokens/{id}, which needs "User API Tokens Read",
+// an account-category permission the setup token deliberately does not carry.
+// Asked with the real token on 2026-08-30, that call answers "Unauthorized to
+// access requested resource".
+//
+// So the pattern this was written for — reject a token that carries more than
+// was asked for — requires the token to be broader than the rule is meant to
+// enforce. It is kept for the case where a read-back genuinely is available,
+// and JudgeZone below is what the wizard uses.
+//
 // It takes the decoded body rather than making the call, so the comparison is
 // testable without a network and without a credential.
 func Judge(raw []byte, want []Permission) (Verdict, error) {
@@ -219,6 +232,47 @@ func Judge(raw []byte, want []Permission) (Verdict, error) {
 	}
 	sort.Strings(v.Excess)
 	return v, nil
+}
+
+// zoneScope maps a form key onto the name Cloudflare uses in a zone's own
+// permissions list. Only one differs, and it is the one that matters most: the
+// form says "dns" and the zone says "dns_records".
+var zoneScope = map[string]string{
+	"dns": "dns_records",
+}
+
+// JudgeZone reads what a token can actually do ON ONE ZONE.
+//
+// GET /zones?name=… returns a "permissions" array — ["#dns_records:edit",
+// "#dns_records:read", "#zone:read"] — and that is the effective grant, from
+// the zone's own answer, for the token that asked. It is a better question than
+// the one Judge asks: what matters is what this credential can do here, not
+// what it was nominally created with.
+//
+// What it CANNOT tell you is what else the token reaches. A token scoped to
+// every zone in the account answers identically on this one. Verdict.AllZones
+// is therefore left false rather than guessed at, and Explain says so — an
+// unanswered question reported as a clean answer is the failure this whole
+// package is written against.
+func JudgeZone(active bool, zonePerms []string, want []Permission) Verdict {
+	v := Verdict{Valid: active}
+
+	granted := map[string]bool{}
+	for _, p := range zonePerms {
+		granted[strings.TrimPrefix(strings.ToLower(strings.TrimSpace(p)), "#")] = true
+	}
+	for _, p := range want {
+		scope := p.Key
+		if alt, ok := zoneScope[scope]; ok {
+			scope = alt
+		}
+		// An edit implies the read, and Cloudflare lists both; asking for edit
+		// and finding only read is missing, not satisfied.
+		if !granted[scope+":"+p.Type] {
+			v.Missing = append(v.Missing, p)
+		}
+	}
+	return v
 }
 
 // normalise reduces Cloudflare's user-facing permission names to something

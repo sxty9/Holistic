@@ -20,6 +20,48 @@ import (
 // reaches a file through Paths, and the recorder below is the only Machine any
 // test ever hands it.
 
+// fakeCF stands in for Cloudflare. It answers, and it records what it was
+// asked, so a test can assert that a step read rather than guessing that it
+// did. It has no write, because the interface has none — see cloudflare.go.
+type fakeCF struct {
+	mu      sync.Mutex
+	asked   []string
+	active  bool
+	zone    Zone
+	zoneErr error
+	records []DNSRecord
+	recErr  error
+}
+
+func newFakeCF() *fakeCF {
+	return &fakeCF{
+		active: true,
+		zone: Zone{
+			ID: "zone-1", Name: testDomain, Status: "active", AccountID: "acct-1",
+			Nameservers: []string{"one.ns.invalid", "two.ns.invalid"},
+			Permissions: []string{"#zone:read", "#dns_records:read", "#dns_records:edit",
+				"#zone_settings:edit", "#email_routing_rule:edit"},
+		},
+	}
+}
+
+func (f *fakeCF) note(s string) { f.mu.Lock(); f.asked = append(f.asked, s); f.mu.Unlock() }
+
+func (f *fakeCF) TokenActive(context.Context, string) (bool, error) {
+	f.note("token-verify")
+	return f.active, nil
+}
+
+func (f *fakeCF) Zone(_ context.Context, _, domain string) (Zone, error) {
+	f.note("zone " + domain)
+	return f.zone, f.zoneErr
+}
+
+func (f *fakeCF) Records(_ context.Context, _, id string) ([]DNSRecord, error) {
+	f.note("records " + id)
+	return f.records, f.recErr
+}
+
 type recorder struct {
 	mu      sync.Mutex
 	calls   []string
@@ -88,6 +130,7 @@ type kit struct {
 	led  *ledger.Ledger
 	p    Paths
 	m    *recorder
+	cf   *fakeCF
 	etc  string
 	resp Response
 	ferr error
@@ -113,6 +156,7 @@ func newKit(t *testing.T) *kit {
 		CoreXUnit:       "corex-api.test",
 		SolisuiteUnit:   "solisuite.test",
 		ConnectorUnit:   "warpgate.test",
+		WarpgateBin:     "warpgate-that-is-recorded-not-run",
 		Corexctl:        "corexctl-that-is-never-executed",
 		DataDir:         filepath.Join(d, "data"),
 	}
@@ -120,12 +164,16 @@ func newKit(t *testing.T) *kit {
 	if err != nil {
 		t.Fatal(err)
 	}
-	k := &kit{t: t, led: led, p: p, m: newRecorder(), etc: etc, resp: Response{Status: 200, Body: "<!doctype html>"}}
+	k := &kit{t: t, led: led, p: p, m: newRecorder(), cf: newFakeCF(), etc: etc,
+		resp: Response{Status: 200, Body: "<!doctype html>"}}
 	k.m.out[p.Corexctl+" admin list"] = "henry@" + testDomain + "  (administrator)"
 	k.m.out["claude --version"] = "claude 2.4.1"
-	k.e = New(led, p, k.m, func(ctx context.Context, url string) (Response, error) {
+	// NewWith, never New: New builds a real Cloudflare client, and a test that
+	// can reach the internet is a test whose result depends on somebody else's
+	// uptime.
+	k.e = NewWith(led, p, k.m, func(ctx context.Context, url string) (Response, error) {
 		return k.resp, k.ferr
-	})
+	}, k.cf)
 	return k
 }
 
@@ -672,37 +720,96 @@ func TestAStepBlocksOnWhatItActuallyConsumes(t *testing.T) {
 
 // The provider steps are defined and honest about being unwritten. Pending, not
 // failed: they are ahead of the wizard, not broken by it.
-func TestProviderStepsAreDefinedAndSayTheyAreNotWrittenYet(t *testing.T) {
+// The nine steps that talk to somebody else, run against a stand-in for that
+// somebody. They used to answer "not implemented yet"; this is what they answer
+// now, and the check is on the guarantees rather than on the wording.
+func TestTheProviderStepsRead(t *testing.T) {
 	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.run("domain")
 	k.answer("token-verify", testToken)
-	// The local steps these wait on, stood in for so that each provider step is
-	// reached rather than blocked one row earlier. A blocked step says what it
-	// is waiting for, which is right and is checked elsewhere; what is being
-	// checked here is what each one says once it is its turn.
 	k.standIn("token-store", "plan-show", "ingress-write")
+	// warpgate is recorded rather than run, and its answers are what a settled
+	// edge and a registered connector look like.
+	k.m.out[k.p.WarpgateBin+" -config "+k.p.WarpgateConfig+" plan"] =
+		"Edge plan for the configured root domain (2 apps)\n\nNothing to do. The edge already matches the configuration."
+	k.m.out["journalctl -u "+k.p.ConnectorUnit+" -b --no-pager -n 200"] =
+		"INF Registered tunnel connection connIndex=0\nINF Registered tunnel connection connIndex=1"
+	k.m.active[k.p.ConnectorUnit] = true
 
 	for _, id := range []string{
 		"token-verify", "zone-resolve", "nameservers", "zone-inventory",
 		"tunnel-ensure", "dns-apply", "connector-registered", "cert-wait", "nonce-probe",
 	} {
 		row := k.run(id)
-		if row.Status != ledger.Pending {
-			t.Errorf("%s: %s, expected pending — %s", id, row.Status, row.Detail)
-		}
-		if !strings.Contains(row.Detail, "not implemented yet") {
-			t.Errorf("%s does not say it is unwritten: %q", id, row.Detail)
-		}
 		if row.Desired == "" {
 			t.Errorf("%s does not say what it would do, so the page cannot show what is coming", id)
 		}
-		// Stand in for it so the next one in the chain is reached too.
+		if row.Status == ledger.Failed {
+			t.Errorf("%s failed against a healthy stand-in: %s", id, row.Detail)
+		}
+		if strings.Contains(row.Detail, "not implemented") {
+			t.Errorf("%s still reports itself unwritten: %q", id, row.Detail)
+		}
 		k.standIn(id)
 	}
-	if len(k.m.unitCalls()) > 0 {
-		t.Errorf("an unimplemented step touched a service: %v", k.m.unitCalls())
+
+	// Each one asked for the thing its verdict is about. "Something read
+	// something" is not the claim — a step that returns a verdict without
+	// making the call it is a verdict about is a step whose answer is about
+	// nothing, and with nine of them sharing one stand-in, a single reader
+	// would have satisfied a check that only counted.
+	asked := strings.Join(k.cf.asked, "\n")
+	for _, want := range []string{
+		"token-verify",       // the token was checked
+		"zone " + testDomain, // and the zone it was checked against
+		"records zone-1",     // the inventory really listed the zone
+	} {
+		if !strings.Contains(asked, want) {
+			t.Errorf("nothing asked Cloudflare for %q; the steps that report on it did not look", want)
+		}
 	}
-	if _, err := os.Stat(k.etc); !os.IsNotExist(err) {
-		t.Error("an unimplemented step wrote configuration")
+}
+
+// THE ARCHITECTURAL GUARANTEE: this package never writes to a provider.
+//
+// The Cloudflare seam has no write method, which the compiler enforces. What it
+// cannot enforce is that a step does not shell out to curl, or to cloudflared,
+// or to anything else that could. Warpgate is the one thing in this landscape
+// that writes DNS — it is where the ownership marker, the refusal to overwrite
+// a foreign record, the separate confirmation for a deletion and the journal
+// live — and a second writer would be a second thing that has to be taught all
+// of it.
+func TestNoProviderStepWritesAnythingItself(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.run("domain")
+	k.answer("token-verify", testToken)
+	k.standIn("token-store", "plan-show", "ingress-write")
+	k.m.out[k.p.WarpgateBin+" -config "+k.p.WarpgateConfig+" plan"] =
+		"Edge plan for the configured root domain (2 apps)\n\nNothing to do. The edge already matches the configuration."
+	k.m.active[k.p.ConnectorUnit] = true
+
+	for _, id := range []string{
+		"token-verify", "zone-resolve", "nameservers", "zone-inventory",
+		"tunnel-ensure", "dns-apply", "connector-registered", "cert-wait", "nonce-probe",
+	} {
+		k.run(id)
+		k.standIn(id)
+	}
+
+	for _, c := range k.m.calls {
+		cmd, ok := strings.CutPrefix(c, "run ")
+		if !ok {
+			continue
+		}
+		name, _, _ := strings.Cut(cmd, " ")
+		switch name {
+		case k.p.WarpgateBin, "journalctl":
+			// warpgate is the only writer, and journalctl is a read.
+		default:
+			t.Errorf("a provider step ran %q. Every write goes through warpgate; nothing else may reach a provider", cmd)
+		}
 	}
 }
 
