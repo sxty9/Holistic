@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -41,6 +42,12 @@ const (
 	defaultPrefix = "/opt/holistic"
 	defaultConf   = "/etc/holistic"
 	defaultState  = "/var/lib/holistic"
+
+	// The unit the seal disables and reopen brings back. Named here rather
+	// than discovered: it is the same string as internal/steps/paths.go, and a
+	// reopen that enabled a different unit than the seal disabled would report
+	// success and leave nothing listening.
+	setupUnit = "holistic-setup.service"
 )
 
 // The units this tool may restart. Named rather than discovered: a glob over
@@ -67,6 +74,8 @@ func main() {
 		err = cmdCode(os.Args[2:])
 	case "upgrade":
 		err = cmdUpgrade(os.Args[2:])
+	case "setup":
+		err = cmdSetup(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -87,6 +96,7 @@ func usage() {
   holistic version              what is installed here, and what is available
   holistic code                 mint a fresh setup code (before the instance is claimed)
   holistic upgrade              fetch the latest release, verify it, swap it in
+  holistic setup reopen         put the assistant back on the LAN, with a fresh code
 
 Every command takes -prefix, -conf and -state if this instance does not live in
 the usual places. upgrade takes -dry-run, -version and -base-url.
@@ -161,12 +171,15 @@ func cmdCode(args []string) error {
 	// The claim is one-way. Minting a fresh code on a claimed instance would
 	// reopen the door that claiming closed — that is Jellyfin #6486, where an
 	// unauthenticated visitor could walk the setup again and take the admin
-	// account. There is a way back, but it is `corexctl setup reopen`, which
-	// says what it is doing.
+	// account. There is a way back, but it is `holistic setup reopen`, refused
+	// unless somebody confirms it at the terminal. Until 2026-08-30 this named
+	// `corexctl setup reopen`, which lives in another binary and was never
+	// written: the one instruction for somebody already locked out pointed at
+	// nothing.
 	if release.Claimed(*conf) {
 		return fmt.Errorf("this instance is already claimed, so there is nothing to let anyone in with.\n"+
 			"A setup code now would reopen a door that was deliberately shut.\n"+
-			"If you genuinely need to run setup again:  corexctl setup reopen\n"+
+			"If you genuinely need to run setup again:  sudo holistic setup reopen\n"+
 			"(%s/claimed is what records it.)", *conf)
 	}
 
@@ -174,16 +187,7 @@ func cmdCode(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(*conf, 0o750); err != nil {
-		return err
-	}
-	// 0640 root:corex, written at its final mode. Between an open and a later
-	// chmod there is a window, and a secret is what gets read during it.
-	tmp := filepath.Join(*conf, ".setup.claim.tmp")
-	if err := os.WriteFile(tmp, []byte(code+"\n"), 0o640); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, filepath.Join(*conf, "setup.claim")); err != nil {
+	if err := writeClaim(*conf, code); err != nil {
 		return err
 	}
 
@@ -350,3 +354,134 @@ func binariesIn(rel *release.Release) ([]string, error) {
 }
 
 func platform() string { return runtime.GOOS + "-" + runtime.GOARCH }
+
+// cmdSetup is the way back in, and the only one. The wizard's last act seals
+// the instance: it writes `claimed`, destroys the setup code and disables the
+// listener, all in one transaction, so that the LAN door is shut before the
+// tunnel opens. That is deliberate and it is one-way over the network.
+//
+// It cannot be one-way on the machine. A domain moves, a Cloudflare account is
+// suspended, an operator inherits a server — and an instance that can never be
+// reconfigured is a brick with data in it. So: a way back, from a root shell,
+// that says out loud what it is doing.
+//
+// What it must NOT be is what Jellyfin #6486 was: setup reachable again by
+// anyone who can reach the port. Hence a fresh code, minted here and shown
+// once, before the listener is allowed to come back.
+func cmdSetup(args []string) error {
+	if len(args) == 0 || args[0] != "reopen" {
+		return fmt.Errorf("the only thing to do to a finished setup is reopen it:\n  sudo %s setup reopen",
+			filepath.Join(defaultPrefix, "bin", "holistic"))
+	}
+	fs := flag.NewFlagSet("setup reopen", flag.ExitOnError)
+	_, conf, _ := paths(fs)
+	yes := fs.Bool("yes", false, "do not ask for confirmation")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("this removes %s/claimed and starts a listener, so it needs root:\n  sudo %s setup reopen",
+			*conf, filepath.Join(defaultPrefix, "bin", "holistic"))
+	}
+	if !release.Claimed(*conf) {
+		return fmt.Errorf("this instance is not claimed, so setup was never closed.\n"+
+			"If nothing is listening, %s is what starts it, and `holistic code` mints a code for it.",
+			setupUnit)
+	}
+
+	if !*yes && !confirm(
+		"This puts the setup assistant back on the local network.",
+		"Anyone who can reach this machine's LAN address will see it, and the code below",
+		"is all that stands between them and it. Do it while you are at the machine, and",
+		"finish or re-close the setup rather than leaving it open.") {
+		return fmt.Errorf("nothing was changed")
+	}
+
+	code, err := reopenSetup(*conf, runCmd)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("\n  setup code   %s\n\n", code)
+	fmt.Println("  Setup is open again on this machine's LAN address.")
+	fmt.Println("  Your accounts, mail and files are untouched — this reopens the assistant,")
+	fmt.Println("  not the sign-up. Closing setup at the end of the run seals it again.")
+	return nil
+}
+
+// confirm asks on the terminal, not on stdin: `holistic` may be run from a
+// script whose stdin is a pipe, and reading a reopen out of a pipe is how an
+// unattended job would silently reopen setup.
+func confirm(lines ...string) bool {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "\nno terminal to ask on. If you mean it: holistic setup reopen -yes")
+		return false
+	}
+	defer tty.Close()
+	fmt.Fprintln(tty)
+	for _, l := range lines {
+		fmt.Fprintln(tty, "  "+l)
+	}
+	fmt.Fprint(tty, "\n  Reopen setup? [y/N] ")
+	var answer string
+	fmt.Fscanln(tty, &answer)
+	return strings.EqualFold(strings.TrimSpace(answer), "y")
+}
+
+// writeClaim puts the code on disk at 0640, written at its final mode. Between
+// an open and a later chmod there is a window, and a secret is what gets read
+// during it. Shared by `code` and `setup reopen` so the two cannot drift into
+// writing the same file two ways.
+func writeClaim(conf, code string) error {
+	if err := os.MkdirAll(conf, 0o750); err != nil {
+		return err
+	}
+	tmp := filepath.Join(conf, ".setup.claim.tmp")
+	if err := os.WriteFile(tmp, []byte(code+"\n"), 0o640); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(conf, "setup.claim"))
+}
+
+// runCmd is systemctl and nothing else; it returns the output because a
+// systemctl failure says why in its output and nowhere else.
+func runCmd(name string, args ...string) (string, error) {
+	out, err := exec.Command(name, args...).CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+// reopenSetup is the reopen itself, with systemctl passed in so the order can
+// be proven without a machine to break.
+//
+// The code first, then the unclaim, then the listener — the inverse of the
+// seal's order, and for the inverse reason. A failure partway leaves an
+// instance that is unclaimed with nothing listening, which is inert and is
+// fixed by running this again. The other order opens the door and then goes
+// looking for a key.
+func reopenSetup(conf string, systemctl func(string, ...string) (string, error)) (string, error) {
+	// The seal is checked here and not only in cmdSetup, because minting first
+	// and finding out afterwards leaves a live setup code on the disk of an
+	// instance nobody was reopening. It is inert while the unit is disabled,
+	// and it is still a secret lying somewhere nobody will look.
+	if !release.Claimed(conf) {
+		return "", fmt.Errorf("there is no seal at %s to remove", filepath.Join(conf, "claimed"))
+	}
+	code, err := mintCode()
+	if err != nil {
+		return "", err
+	}
+	if err := writeClaim(conf, code); err != nil {
+		return "", err
+	}
+	if err := os.Remove(filepath.Join(conf, "claimed")); err != nil {
+		return "", fmt.Errorf("the setup code was minted but the seal is still there, so the unit's\n"+
+			"ConditionPathExists will refuse to start it: %w", err)
+	}
+	// enable --now, not start: the point of the seal was that it survived a
+	// reboot, so its undoing has to as well.
+	if out, err := systemctl("systemctl", "enable", "--now", setupUnit); err != nil {
+		return "", fmt.Errorf("unclaimed, but %s did not come up: %v\n%s", setupUnit, err, out)
+	}
+	return code, nil
+}
