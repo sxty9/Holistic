@@ -12,6 +12,8 @@ import (
 
 	"github.com/sxty9/Holistic/internal/claim"
 	"github.com/sxty9/Holistic/internal/steps"
+	"os"
+	"time"
 )
 
 // inertMachine is the only Machine these tests ever hand the engine. Nothing
@@ -381,5 +383,73 @@ func TestAnInstanceWithNoCodeAndNoSealStaysUp(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != 404 {
 		t.Errorf("POST /claim/ answered %d, want 404 — it cannot work and should not exist", rec.Code)
+	}
+}
+
+// An expired code is not a probe, and the journal has to say which refusal it
+// was.
+//
+// Both had one line — "wrong setup code offered by …" — and one counter. So an
+// operator who took longer than an hour saw their own attempt reported back to
+// them on the first screen as somebody trying to claim their machine, and
+// anybody reading the journal went looking for an intruder who was the person
+// holding the terminal.
+func TestAnExpiredCodeIsNotCountedAsAProbe(t *testing.T) {
+	dir := t.TempDir()
+	claimAt := filepath.Join(dir, "setup.claim")
+	code, err := claim.Mint(claimAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Age the file past the lifetime. Load takes `born` from its mtime, which
+	// is what makes a code outlive the process that minted it — and what makes
+	// this reachable without waiting an hour.
+	old := time.Now().Add(-claim.Lifetime - time.Minute)
+	if err := os.Chtimes(claimAt, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := newServer(claimAt, filepath.Join(dir, "provisioned.json"), filepath.Join(dir, "claimed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := srv.routes()
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/claim/", strings.NewReader("code="+code))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Host = "192.168.178.98"
+	r.RemoteAddr = "192.168.178.42:50000"
+	h.ServeHTTP(rec, r)
+
+	if rec.Code == http.StatusSeeOther {
+		t.Fatal("an expired code was accepted")
+	}
+	if n := len(srv.refusedCount()); n != 0 {
+		t.Errorf("an expired code was counted as a probe (%d), so the operator's own attempt "+
+			"appears on their first screen as somebody else's", n)
+	}
+
+	// A genuinely wrong one still counts — and it needs a guard that is not
+	// already expired, because the lifetime is checked before the code is.
+	// Reusing the aged one above would have tested nothing: every attempt
+	// against it is expired, including a deliberately wrong one.
+	fresh := t.TempDir()
+	freshClaim := filepath.Join(fresh, "setup.claim")
+	if _, err := claim.Mint(freshClaim); err != nil {
+		t.Fatal(err)
+	}
+	srv2, err := newServer(freshClaim, filepath.Join(fresh, "provisioned.json"), filepath.Join(fresh, "claimed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	r = httptest.NewRequest("POST", "/claim/", strings.NewReader("code=not-the-code"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Host = "192.168.178.98"
+	r.RemoteAddr = "192.168.178.99:50000"
+	srv2.routes().ServeHTTP(rec, r)
+	if n := len(srv2.refusedCount()); n != 1 {
+		t.Errorf("a wrong code was counted %d times, want 1", n)
 	}
 }

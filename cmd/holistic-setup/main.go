@@ -275,7 +275,12 @@ func (s *server) redeem(w http.ResponseWriter, r *http.Request) {
 	}
 	err := s.guard.Redeem(r.PostFormValue("code"))
 	if err != nil {
-		s.noteRefusal(r.RemoteAddr)
+		// An expired code is not a probe. It is the operator being slower than
+		// an hour, which is an ordinary thing to be, and counting it as a wrong
+		// code puts their own attempt into the "somebody tried to claim this
+		// machine" banner on their first screen. Two different events had one
+		// line, and the line named the wrong one.
+		s.noteRefusal(r.RemoteAddr, err)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusUnauthorized)
@@ -309,16 +314,40 @@ func explain(err error) string {
 	return "The code was not accepted."
 }
 
-func (s *server) noteRefusal(remote string) {
+func (s *server) noteRefusal(remote string, why error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if host, _, ok := strings.Cut(remote, ":"); ok {
 		remote = host
 	}
-	s.refused = append(s.refused, remote)
-	// Logged as well as counted. The owner sees the count on their first
-	// screen; the journal is where it stays afterwards.
-	fmt.Fprintf(os.Stderr, "holistic-setup: wrong setup code offered by %s\n", remote)
+	// Only a wrong code is a probe. An expired one is the operator being
+	// slower than an hour, a spent one is a second browser tab, and a locked
+	// guard is the consequence of earlier attempts rather than a new one.
+	// Counting those into `refused` would put the operator's own attempts into
+	// the "somebody tried to claim this machine" banner on their first screen,
+	// which is how a warning that matters becomes one nobody reads.
+	if errors.Is(why, claim.ErrWrongCode) {
+		s.refused = append(s.refused, remote)
+	}
+	// Every refusal is logged, and named. "wrong setup code" for an expired one
+	// sends whoever reads the journal looking for an intruder who is the person
+	// holding the terminal.
+	fmt.Fprintf(os.Stderr, "holistic-setup: setup code refused from %s: %s\n", remote, reason(why))
+}
+
+// reason turns a refusal into the sentence a journal should carry.
+func reason(err error) string {
+	switch {
+	case errors.Is(err, claim.ErrWrongCode):
+		return "wrong code"
+	case errors.Is(err, claim.ErrExpired):
+		return "the code has expired; mint a new one on the machine"
+	case errors.Is(err, claim.ErrLockedOut):
+		return "too many wrong codes; the guard is locked until a new code is minted"
+	case errors.Is(err, claim.ErrAlreadyRun):
+		return "the code was already spent"
+	}
+	return err.Error()
 }
 
 func (s *server) refusedCount() []string {

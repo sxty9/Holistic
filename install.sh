@@ -605,6 +605,13 @@ install_release() {
 
 	systemctl daemon-reload </dev/null
 	systemctl enable --now holistic-setup.service </dev/null >/dev/null
+	# And restart it, because `enable --now` does NOTHING to a unit that is
+	# already enabled and running — which is every upgrade. The binary under
+	# $PREFIX/bin was replaced a few lines ago and the process serving the LAN
+	# is still the old one; without this, an upgrade installs and does not take
+	# effect, and says it worked. Measured: v0.1.2 on disk at 15:30, the process
+	# answering it started at 14:30.
+	systemctl try-restart holistic-setup.service </dev/null 2>/dev/null || true
 	note "holistic-setup.service is running"
 
 	record_installed "$dir" "$src"
