@@ -31,6 +31,7 @@ PLATFORMS=(linux/amd64 linux/arm64)
 # grows things nobody can explain later.
 COMPONENTS=(
 	"Holistic:./cmd/holistic-setup:holistic-setup"
+	"Holistic:./cmd/holistic:holistic"
 	"coreX:./cmd/corex-api:corex-api"
 	"coreX:./cmd/corex-routedge:corex-routedge"
 	"coreX:./cmd/corexctl:corexctl"
@@ -62,7 +63,37 @@ keygen() {
 
 	[ "$(id -u)" -eq 0 ] || die "writing $KEY needs root. Re-run with sudo, or set HOLISTIC_RELEASE_KEY to a path you own."
 
-	install -d -m 0700 "$(dirname "$KEY")"
+	# The directory's mode is only ever set when this line CREATES it.
+	#
+	# It used to be an unconditional `install -d -m 0700`, and on 2026-08-17 at
+	# 19:30:35 that ran against an /etc/holistic which already existed and was
+	# already the running landscape's secret store — 0640 root:holistic files,
+	# every service account a member of the holistic group, and the directory
+	# carrying the group execute bit those accounts need to traverse it.
+	#
+	# 0700 took that bit away. Nothing failed at the time, because the services
+	# were already running and already had their secrets open. They died at the
+	# next boot, on 2026-08-20, all eleven of them, every one on the same line:
+	# "no JWT secret: set HOLISTIC_SECRET_FILE or HOLISTIC_SECRET". They have
+	# been restarting every two seconds since — roughly 367,000 attempts each —
+	# and nobody noticed, because their DNS had already been removed for the
+	# migration.
+	#
+	# One millisecond separates this directory's ctime from release.key's. It
+	# was this line.
+	#
+	# The installer was hardened against exactly this on 2026-08-30, and this
+	# script — its sibling, four files away — was not looked at. So: create it
+	# if it is absent, and otherwise leave whatever is there exactly as it is.
+	# A key file written 0600 root:root inside a directory somebody else owns is
+	# still perfectly safe; changing the directory to make it feel safer is what
+	# did the damage.
+	keydir="$(dirname "$KEY")"
+	if [ -d "$keydir" ]; then
+		note "$keydir exists — its owner and mode are left alone"
+	else
+		install -d -m 0700 "$keydir"
+	fi
 	# Ed25519: small, fast, no parameter choices to get wrong, and openssl can
 	# verify it with nothing else installed. The private key is written with
 	# its final mode by umask rather than chmod'd afterwards.
@@ -163,7 +194,7 @@ build_one() {
 		cd "$dir"
 		CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
 			go build -trimpath \
-			-ldflags "-s -w -X main.version=$version" \
+			-ldflags "-s -w -X main.version=$version -X main.pubkeyB64=$(installer_pubkey | base64 -w0)" \
 			-o "$dest/$out" "$pkg"
 	)
 }
@@ -243,6 +274,11 @@ build() {
        cd $SRC_ROOT/Solisuite/web && pnpm install && pnpm build"
 		fi
 
+		# The version, as a file in the archive. It is the only way to answer
+		# "what is installed here?" on a machine installed from
+		# /latest/download, because "latest" is not a version — it is a
+		# redirect that means something else next week. install.sh copies it
+		# into the state directory and `holistic upgrade` reads it back.
 		printf '%s\n' "$version" >"$stage/VERSION"
 
 		(cd "$DIST/stage-$goos-$goarch" && tar -czf "$DIST/holistic-$goos-$goarch.tar.gz" holistic)

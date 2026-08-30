@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func open(t *testing.T) (*Ledger, string) {
@@ -163,5 +164,45 @@ func TestSaveIsAtomic(t *testing.T) {
 	}
 	if _, err := os.Stat(path + ".incoming"); !os.IsNotExist(err) {
 		t.Error("a temporary file was left behind")
+	}
+}
+
+// A wait that keeps saying "since just now" is the six-hour lie about a
+// nameserver change, told in a timestamp instead of a spinner. Mark used to set
+// At unconditionally, so every re-check of an unchanged status pushed the
+// moment the wait began forward to the present.
+func TestReMarkingAStatusDoesNotMoveWhenItBegan(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(filepath.Join(dir, "provisioned.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tick := time.Date(2026, 8, 30, 1, 0, 0, 0, time.UTC)
+	l.now = func() time.Time { tick = tick.Add(time.Hour); return tick }
+
+	if err := l.Mark("cert-wait", WaitingOnThem, "Cloudflare"); err != nil {
+		t.Fatal(err)
+	}
+	began := l.Steps()[0].At
+
+	for i := 0; i < 3; i++ {
+		if err := l.Mark("cert-wait", WaitingOnThem, "Cloudflare"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := l.Steps()[0]
+	if got.At != began {
+		t.Errorf("three re-checks moved the start of the wait from %s to %s", began, got.At)
+	}
+	if got.LookedAt == began {
+		t.Errorf("lookedAt did not move: a row nobody is watching would look the same as this one")
+	}
+
+	// A real change does move it. Otherwise the field is frozen, not honest.
+	if err := l.Mark("cert-wait", Passed, ""); err != nil {
+		t.Fatal(err)
+	}
+	if l.Steps()[0].At == began {
+		t.Errorf("the status changed and At stayed at %s", began)
 	}
 }

@@ -64,7 +64,18 @@ type Step struct {
 	// matters enough to keep: everything reported success the week inbound mail
 	// was being destroyed.
 	Proof string `json:"proof,omitempty"`
-	At    string `json:"at,omitempty"`
+	// At is when this step REACHED this status, and it does not move while the
+	// status stays the same. On a wait that is the only honest reading: the
+	// Stepper renders it as "since", a fact about when the waiting began, and a
+	// re-check that pushed it forward would make every wait read as having just
+	// started — the six-hour lie about a nameserver change, told in a different
+	// field.
+	At string `json:"at,omitempty"`
+	// LookedAt is when it was last examined, and it moves on every check. It is
+	// the proof of life in a component with no animation: without it, a row
+	// that has not changed in an hour is indistinguishable from one nothing is
+	// watching.
+	LookedAt string `json:"lookedAt,omitempty"`
 }
 
 // Resource is something created outside this machine.
@@ -159,10 +170,13 @@ func (l *Ledger) Domain(d string) error {
 func (l *Ledger) Mark(id string, st Status, detail string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	s := l.state.Steps[id]
-	s.ID, s.Status, s.Detail = id, st, detail
-	s.At = l.now().UTC().Format(time.RFC3339)
-	if _, seen := l.state.Steps[id]; !seen {
+	s, seen := l.state.Steps[id]
+	now := l.now().UTC().Format(time.RFC3339)
+	if !seen || s.Status != st {
+		s.At = now
+	}
+	s.ID, s.Status, s.Detail, s.LookedAt = id, st, detail, now
+	if !seen {
 		l.state.Order = append(l.state.Order, id)
 	}
 	l.state.Steps[id] = s
@@ -183,8 +197,11 @@ func (l *Ledger) Prove(id, proof string) error {
 		s.ID = id
 		l.state.Order = append(l.state.Order, id)
 	}
-	s.Status, s.Proof = Passed, proof
-	s.At = l.now().UTC().Format(time.RFC3339)
+	now := l.now().UTC().Format(time.RFC3339)
+	if s.Status != Passed {
+		s.At = now
+	}
+	s.Status, s.Proof, s.LookedAt = Passed, proof, now
 	l.state.Steps[id] = s
 	return l.save()
 }

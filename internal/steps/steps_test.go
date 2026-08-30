@@ -1,0 +1,920 @@
+package steps
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/sxty9/Holistic/internal/ledger"
+)
+
+// Nothing in this file may start, stop or restart anything on the machine
+// running it, and nothing may write outside t.TempDir(). Both are structural
+// rather than promised: every step reaches systemd through Machine, every step
+// reaches a file through Paths, and the recorder below is the only Machine any
+// test ever hands it.
+
+type recorder struct {
+	mu      sync.Mutex
+	calls   []string
+	active  map[string]bool
+	enabled map[string]bool
+	out     map[string]string
+	fail    map[string]error
+}
+
+func newRecorder() *recorder {
+	return &recorder{
+		active:  map[string]bool{},
+		enabled: map[string]bool{},
+		out:     map[string]string{},
+		fail:    map[string]error{},
+	}
+}
+
+func (r *recorder) note(s string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, s)
+}
+
+func (r *recorder) Restart(unit string) error {
+	r.note("restart " + unit)
+	r.active[unit] = true
+	return r.fail["restart "+unit]
+}
+
+func (r *recorder) EnableNow(unit string) error {
+	r.note("enable-now " + unit)
+	if err := r.fail["enable-now "+unit]; err != nil {
+		return err
+	}
+	r.active[unit], r.enabled[unit] = true, true
+	return nil
+}
+
+func (r *recorder) IsActive(unit string) bool  { return r.active[unit] }
+func (r *recorder) IsEnabled(unit string) bool { return r.enabled[unit] }
+
+func (r *recorder) Run(name string, args ...string) (string, error) {
+	key := strings.Join(append([]string{name}, args...), " ")
+	r.note("run " + key)
+	return r.out[key], r.fail["run "+key]
+}
+
+// unitCalls are the ones that would have touched a service. Everything else the
+// recorder saw is a read.
+func (r *recorder) unitCalls() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, c := range r.calls {
+		if strings.HasPrefix(c, "restart ") || strings.HasPrefix(c, "enable-now ") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+type kit struct {
+	t    *testing.T
+	e    *Engine
+	led  *ledger.Ledger
+	p    Paths
+	m    *recorder
+	etc  string
+	resp Response
+	ferr error
+}
+
+// example.org and .invalid throughout, and every path under t.TempDir(). A test
+// that names this machine's real /etc is a test that passes here and fails, or
+// worse succeeds, somewhere else.
+const testDomain = "example.org"
+
+func newKit(t *testing.T) *kit {
+	t.Helper()
+	d := t.TempDir()
+	etc := filepath.Join(d, "etc")
+	p := Paths{
+		CoreXConfig:     filepath.Join(etc, "corex", "config.json"),
+		CoreXEnv:        filepath.Join(etc, "corex", "corex.env"),
+		SolisuiteConfig: filepath.Join(etc, "solisuite", "config.json"),
+		SolisuiteEnv:    filepath.Join(etc, "solisuite", "solisuite.env"),
+		WarpgateConfig:  filepath.Join(etc, "warpgate", "config.json"),
+		WarpgateIngress: filepath.Join(etc, "warpgate", "ingress.json"),
+		WarpgateToken:   filepath.Join(etc, "warpgate", "cloudflare.token"),
+		CoreXUnit:       "corex-api.test",
+		SolisuiteUnit:   "solisuite.test",
+		ConnectorUnit:   "warpgate.test",
+		Corexctl:        "corexctl-that-is-never-executed",
+		DataDir:         filepath.Join(d, "data"),
+	}
+	led, err := ledger.Open(filepath.Join(d, "var", "provisioned.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := &kit{t: t, led: led, p: p, m: newRecorder(), etc: etc, resp: Response{Status: 200, Body: "<!doctype html>"}}
+	k.m.out[p.Corexctl+" admin list"] = "henry@" + testDomain + "  (administrator)"
+	k.m.out["claude --version"] = "claude 2.4.1"
+	k.e = New(led, p, k.m, func(ctx context.Context, url string) (Response, error) {
+		return k.resp, k.ferr
+	})
+	return k
+}
+
+func (k *kit) answer(id string, v any) {
+	k.t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	if err := k.e.Answer(id, raw); err != nil {
+		k.t.Fatalf("answering %s: %v", id, err)
+	}
+}
+
+func (k *kit) run(id string) Row {
+	k.t.Helper()
+	if err := k.e.Run(id); err != nil {
+		k.t.Fatalf("running %s: %v", id, err)
+	}
+	return k.row(id)
+}
+
+func (k *kit) row(id string) Row {
+	k.t.Helper()
+	for _, r := range k.e.State(false, 0, nil).Steps {
+		if r.ID == id {
+			return r
+		}
+	}
+	k.t.Fatalf("%s is not a step", id)
+	return Row{}
+}
+
+func (k *kit) mustPass(id string) Row {
+	k.t.Helper()
+	r := k.run(id)
+	if r.Status != ledger.Passed {
+		k.t.Fatalf("%s: %s — %s", id, r.Status, r.Detail)
+	}
+	if r.Proof == "" {
+		k.t.Errorf("%s passed without recording how it was shown to be true", id)
+	}
+	return r
+}
+
+// standIn marks a step this build does not implement as passed, so the local
+// steps that genuinely consume its result can be exercised. It is spelled out
+// rather than hidden in a helper name because it is the one place a test asserts
+// something the engine did not establish.
+func (k *kit) standIn(ids ...string) {
+	k.t.Helper()
+	for _, id := range ids {
+		if err := k.led.Mark(id, ledger.Passed, "stood in for by the test suite"); err != nil {
+			k.t.Fatal(err)
+		}
+	}
+}
+
+const testToken = "cf-Zq7Z4mR2xLp9vT1nB8kW6yH3jD5sG0aEQhVuJcRt"
+
+// drive takes the wizard as far as it goes, standing in only for the steps that
+// talk to a provider.
+func (k *kit) drive() {
+	k.t.Helper()
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.answer("display-name", "Henry's box")
+	k.mustPass("display-name")
+	k.answer("storage", filepath.Join(k.p.DataDir, "corex"))
+	k.mustPass("storage")
+	k.answer("engines", "claude")
+	k.mustPass("engines")
+	k.mustPass("admin")
+	k.answer("apps", []appChoice{{ID: "gallery", On: true}})
+	k.mustPass("apps")
+
+	k.answer("token-verify", testToken)
+	k.standIn("token-verify")
+	k.mustPass("token-store")
+
+	k.mustPass("warpgate-config")
+	k.answer("plan-show", true)
+	k.mustPass("plan-show")
+	k.mustPass("ingress-write")
+
+	k.standIn("connector-registered")
+	k.mustPass("solisuite-write")
+	k.mustPass("corex-write")
+
+	k.standIn("nonce-probe")
+	k.mustPass("corex-restart-2")
+}
+
+// snapshot is every configuration file, by content. The ledger is deliberately
+// outside it: its timestamps move on every run and that is what it is for.
+func (k *kit) snapshot() map[string]string {
+	k.t.Helper()
+	out := map[string]string{}
+	if _, err := os.Stat(k.etc); os.IsNotExist(err) {
+		// Nothing written at all is a snapshot too, and it is the one the
+		// "wrote nothing" assertions are usually comparing against.
+		return out
+	}
+	err := filepath.Walk(k.etc, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		out[path] = string(b)
+		return nil
+	})
+	if err != nil {
+		k.t.Fatal(err)
+	}
+	return out
+}
+
+func diffSnapshots(a, b map[string]string) []string {
+	var out []string
+	for path, before := range a {
+		after, still := b[path]
+		switch {
+		case !still:
+			out = append(out, path+" was removed")
+		case before != after:
+			out = append(out, path+" changed")
+		}
+	}
+	for path := range b {
+		if _, had := a[path]; !had {
+			out = append(out, path+" appeared")
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// The rule the whole design rests on. A reconciler is run repeatedly by
+// definition — it is the later diagnosis and the later domain change as well as
+// the first-run wizard — so a second run that rewrites files and bounces
+// services is not a cosmetic flaw, it is the wizard restarting somebody's mail
+// server every time they refresh a page.
+func TestEveryLocalStepIsSafeToRunTwice(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+
+	for _, id := range []string{
+		"domain", "display-name", "storage", "engines", "admin", "apps",
+		"token-store", "warpgate-config", "plan-show", "ingress-write",
+		"solisuite-write", "corex-write", "corex-restart-2",
+	} {
+		t.Run(id, func(t *testing.T) {
+			before := k.snapshot()
+			unitsBefore := len(k.m.unitCalls())
+
+			k.mustPass(id)
+
+			if d := diffSnapshots(before, k.snapshot()); len(d) > 0 {
+				t.Errorf("a second run changed the machine: %s", strings.Join(d, "; "))
+			}
+			units := k.m.unitCalls()[unitsBefore:]
+			// corex-restart-2 restarts on purpose — restarting is what it is —
+			// so it is the one step whose second run is allowed to touch a
+			// unit. It still must not change a file.
+			if id != "corex-restart-2" && len(units) > 0 {
+				t.Errorf("a second run touched services with nothing to apply: %v", units)
+			}
+		})
+	}
+}
+
+// The three-file write, which is the reason this repository exists. Two of them
+// agreeing and the third not is worse than none of them being written: DNS and
+// ingress would be perfect and Solisuite would serve the same document at every
+// hostname, with nothing anywhere reporting an error.
+func TestTheThreeConfigWriteIsAllOrNothing(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("this makes a directory unwritable, which root ignores")
+	}
+	for _, tc := range []struct {
+		name    string
+		already bool
+	}{
+		{name: "nothing was there before"},
+		{name: "all three were already written", already: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			k := newKit(t)
+			k.answer("domain", testDomain)
+			k.mustPass("domain")
+
+			if tc.already {
+				k.mustPass("apps")
+			}
+			// Everything before the write is fine; the write itself fails
+			// partway. That is the case the rollback exists for — a bad value
+			// or an unparseable file is caught before the first byte.
+			soliDir := filepath.Dir(k.p.SolisuiteConfig)
+			if err := os.MkdirAll(soliDir, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(soliDir, 0o500); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(soliDir, 0o750) })
+
+			before := k.snapshot()
+			// Change the answer so all three files have something to write.
+			k.answer("apps", []appChoice{{ID: "gallery", On: true}, {ID: "files", On: false}})
+
+			row := k.run("apps")
+			if row.Status != ledger.Failed {
+				t.Fatalf("a failed write reported %s: %s", row.Status, row.Detail)
+			}
+			if d := diffSnapshots(before, k.snapshot()); len(d) > 0 {
+				t.Errorf("a partial write was left behind: %s", strings.Join(d, "; "))
+			}
+			if !tc.already {
+				for _, p := range []string{k.p.WarpgateConfig, k.p.CoreXConfig} {
+					if _, err := os.Stat(p); !os.IsNotExist(err) {
+						t.Errorf("%s exists after a write that did not complete", p)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Conflicts. Every one of these is something on the machine that this wizard
+// did not put there, and the only acceptable behaviour is to say so in full and
+// change nothing.
+func TestSomethingWeDidNotCreateIsAConflictAndNotAnOverwrite(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		step    string
+		setUp   func(k *kit)
+		mention []string
+	}{
+		{
+			name: "data already lives somewhere else",
+			step: "storage",
+			setUp: func(k *kit) {
+				other := filepath.Join(k.t.TempDir(), "existing-data")
+				mkdirWithSomethingIn(k.t, other)
+				writeJSONFile(k.t, k.p.CoreXConfig, map[string]any{"dataDir": other})
+				k.answer("storage", filepath.Join(k.p.DataDir, "corex"))
+			},
+			mention: []string{"dataDir"},
+		},
+		{
+			name: "the app lists belong to another domain",
+			step: "apps",
+			setUp: func(k *kit) {
+				k.answer("domain", testDomain)
+				k.mustPass("domain")
+				writeJSONFile(k.t, k.p.SolisuiteConfig, map[string]any{
+					"apps": []any{map[string]any{"id": "mail", "host": "mail.someone-else.invalid"}},
+				})
+			},
+			mention: []string{"someone-else.invalid"},
+		},
+		{
+			name: "warpgate publishes an app we have never heard of",
+			step: "apps",
+			setUp: func(k *kit) {
+				k.answer("domain", testDomain)
+				k.mustPass("domain")
+				writeJSONFile(k.t, k.p.WarpgateConfig, map[string]any{
+					"apps": []any{
+						map[string]any{"name": "launcher", "upstream": "http://127.0.0.1:8795"},
+						map[string]any{"name": "wiki", "upstream": "http://127.0.0.1:9999"},
+					},
+				})
+			},
+			mention: []string{"wiki"},
+		},
+		{
+			name: "warpgate is already pinned elsewhere",
+			step: "warpgate-config",
+			setUp: func(k *kit) {
+				k.answer("domain", testDomain)
+				k.mustPass("domain")
+				k.mustPass("apps")
+				f := readJSONFile(k.t, k.p.WarpgateConfig)
+				f["configPath"] = "/etc/somewhere-else/ingress.json"
+				writeJSONFile(k.t, k.p.WarpgateConfig, f)
+			},
+			mention: []string{"configPath", "somewhere-else"},
+		},
+		{
+			name: "a different credential is already at the token path",
+			step: "token-store",
+			setUp: func(k *kit) {
+				k.standIn("token-verify")
+				k.answer("token-verify", testToken)
+				if err := os.MkdirAll(filepath.Dir(k.p.WarpgateToken), 0o750); err != nil {
+					k.t.Fatal(err)
+				}
+				if err := os.WriteFile(k.p.WarpgateToken, []byte("somebody-elses-token\n"), 0o600); err != nil {
+					k.t.Fatal(err)
+				}
+			},
+			mention: []string{"Warpgate reads exactly one credential"},
+		},
+		{
+			name: "coreX already answers as somebody else",
+			step: "corex-write",
+			setUp: func(k *kit) {
+				k.answer("domain", testDomain)
+				k.mustPass("domain")
+				k.mustPass("apps")
+				k.standIn("connector-registered")
+				f := readJSONFile(k.t, k.p.CoreXConfig)
+				inst := f["instance"].(map[string]any)
+				inst["publicBaseUrl"] = "https://already-live.invalid"
+				writeJSONFile(k.t, k.p.CoreXConfig, f)
+			},
+			mention: []string{"already-live.invalid", "publicBaseUrl"},
+		},
+		{
+			name: "an environment file overrides what would be written",
+			step: "corex-write",
+			setUp: func(k *kit) {
+				k.answer("domain", testDomain)
+				k.mustPass("domain")
+				k.mustPass("apps")
+				k.standIn("connector-registered")
+				writeFile(k.t, k.p.CoreXEnv,
+					"# left over from the migration\nCOREX_PUBLIC_BASE_URL=https://stale.invalid\n")
+			},
+			mention: []string{"COREX_PUBLIC_BASE_URL", "stale.invalid"},
+		},
+		{
+			name: "solisuite's per-app host family is overridden",
+			step: "solisuite-write",
+			setUp: func(k *kit) {
+				k.answer("domain", testDomain)
+				k.mustPass("domain")
+				k.mustPass("apps")
+				k.standIn("connector-registered")
+				writeFile(k.t, k.p.SolisuiteEnv, "SOLISUITE_APP_HOST_MAIL=mail.stale.invalid\n")
+			},
+			mention: []string{"SOLISUITE_APP_HOST_MAIL"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			k := newKit(t)
+			tc.setUp(k)
+
+			before := k.snapshot()
+			row := k.run(tc.step)
+
+			if row.Status != ledger.Conflict {
+				t.Fatalf("%s returned %s, not a conflict: %s", tc.step, row.Status, row.Detail)
+			}
+			c := row.Conflict
+			if c == nil {
+				t.Fatal("a conflict row carries no conflict")
+			}
+			// The six fields, all of them, every time. A conflict missing its
+			// "why" or its "what to do" is a dead end with a red icon on it.
+			for name, v := range map[string]string{
+				"object": c.Object, "found": c.Found, "desired": c.Desired,
+				"why": c.Why, "unchanged": c.Unchanged, "resolution": c.Resolution,
+			} {
+				if strings.TrimSpace(v) == "" {
+					t.Errorf("the conflict has no %s", name)
+				}
+			}
+			if c.Unchanged != Unchanged {
+				t.Errorf("the promise is not stated as its own field: %q", c.Unchanged)
+			}
+			if c.Consequence == "" {
+				t.Error("the conflict does not say what it costs to leave it alone")
+			}
+			blob := c.Object + c.Found + c.FoundNote + c.Desired + c.Why + c.Resolution + c.Consequence
+			for _, want := range tc.mention {
+				if !strings.Contains(blob, want) {
+					t.Errorf("the conflict never mentions %q, so nobody can find it:\n%s", want, blob)
+				}
+			}
+
+			if d := diffSnapshots(before, k.snapshot()); len(d) > 0 {
+				t.Errorf("%q was promised and %s: %s", Unchanged, "the machine changed anyway", strings.Join(d, "; "))
+			}
+
+			// And there is no way past it. Running it again with the obstacle
+			// still there gives the same answer; nothing accumulates, nothing
+			// escalates into an overwrite.
+			if again := k.run(tc.step); again.Status != ledger.Conflict {
+				t.Errorf("running a conflicted step again got past it: %s", again.Status)
+			}
+		})
+	}
+}
+
+// The failure this whole package is shaped around. coreX runs applyEnv after
+// unmarshalling its JSON, so a variable that reaches the service beats the file
+// the wizard just wrote — and the result is not an error, it is a switch that
+// changes nothing and reports success, with every check that reads the JSON
+// agreeing with it.
+func TestCoreXWriteRefusesWhileAWatchedVariableIsSet(t *testing.T) {
+	// systemd's manager environment reaches every service on the machine, this
+	// one and coreX alike, so a watched variable visible to this process is
+	// evidence coreX will see it too.
+	t.Setenv("COREX_PUBLIC_BASE_URL", "https://left-over.invalid")
+
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.mustPass("apps")
+	k.standIn("connector-registered")
+
+	before := k.snapshot()
+	row := k.run("corex-write")
+
+	if row.Status != ledger.Conflict {
+		t.Fatalf("corex-write went ahead with an override in force: %s — %s", row.Status, row.Detail)
+	}
+	c := row.Conflict
+	if !strings.Contains(c.Object, "COREX_PUBLIC_BASE_URL") {
+		t.Errorf("the refusal does not name the variable: %q", c.Object)
+	}
+	if !strings.Contains(c.Found, "environment") {
+		t.Errorf("the refusal does not say where the variable is: %q", c.Found)
+	}
+	if !strings.Contains(c.Found, "left-over.invalid") {
+		t.Errorf("the refusal does not quote what the variable says: %q", c.Found)
+	}
+	if !strings.Contains(c.Why, "applied AFTER") {
+		t.Errorf("the refusal does not explain why a write would look like it worked: %q", c.Why)
+	}
+	if d := diffSnapshots(before, k.snapshot()); len(d) > 0 {
+		t.Errorf("corex-write wrote anyway: %s", strings.Join(d, "; "))
+	}
+	if calls := k.m.unitCalls(); len(calls) > 0 {
+		t.Errorf("corex-write restarted a service it had refused to configure: %v", calls)
+	}
+}
+
+// The three outputs, checked as three files rather than as one intention. The
+// third is the one nothing has ever written.
+func TestOneAnswerReachesAllThreeFiles(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.answer("apps", []appChoice{{ID: "gallery", On: false}, {ID: "roomsense", On: true}})
+	k.mustPass("apps")
+
+	warp := readJSONFile(t, k.p.WarpgateConfig)
+	names := map[string]bool{}
+	for _, a := range warp["apps"].([]any) {
+		names[a.(map[string]any)["name"].(string)] = true
+	}
+	if !names["roomsense"] {
+		t.Error("an app that was turned on is not in Warpgate's list, so it gets no DNS and no ingress")
+	}
+	if names["gallery"] {
+		t.Error("an app that was turned off is still published")
+	}
+
+	soli := readJSONFile(t, k.p.SolisuiteConfig)
+	seen := map[string]string{}
+	for _, a := range soli["apps"].([]any) {
+		m := a.(map[string]any)
+		host, _ := m["host"].(string)
+		origin, _ := m["origin"].(string)
+		if host == "" || origin == "" {
+			t.Errorf("a Solisuite app carries no host/origin pair, so appFor() falls back to defaultApp: %v", m)
+		}
+		seen[m["id"].(string)] = host
+	}
+	if seen["mail"] != "mail."+testDomain {
+		t.Errorf("Solisuite's Host map is wrong: %v", seen)
+	}
+	// RoomSense has its own server. Listing it here would map its hostname to a
+	// Solisuite document that does not exist.
+	if _, listed := seen["roomsense"]; listed {
+		t.Error("a standalone app was written into Solisuite's app list")
+	}
+
+	core := readJSONFile(t, k.p.CoreXConfig)
+	origins := core["instance"].(map[string]any)["appOrigins"].(map[string]any)
+	if len(origins) != 0 {
+		t.Errorf("appOrigins was populated before any hostname had answered a probe: %v", origins)
+	}
+}
+
+// An origin only exists once a hostname has answered, and once it exists it
+// must survive a restart of this process. Rebuilding the set from memory would
+// write {} over what the probes established, and report success for it.
+func TestProvenOriginsAreNotForgottenBetweenRuns(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.mustPass("apps")
+
+	core := readJSONFile(t, k.p.CoreXConfig)
+	core["instance"].(map[string]any)["appOrigins"] = map[string]any{
+		"mail": "https://mail." + testDomain,
+	}
+	writeJSONFile(t, k.p.CoreXConfig, core)
+
+	k.mustPass("apps")
+	got := readJSONFile(t, k.p.CoreXConfig)["instance"].(map[string]any)["appOrigins"].(map[string]any)
+	if got["mail"] != "https://mail."+testDomain {
+		t.Errorf("a proven origin was erased by a later run of the apps step: %v", got)
+	}
+}
+
+// A step whose result another step consumes must block it, and say which one.
+// The alternative is a wizard that writes coreX's public base URL and flips
+// cookies to Secure before anything answers on the domain — which signs the
+// operator out of the page performing the installation.
+func TestAStepBlocksOnWhatItActuallyConsumes(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.mustPass("apps")
+
+	before := k.snapshot()
+	row := k.run("corex-write")
+	if row.Status != ledger.Pending {
+		t.Fatalf("corex-write ran without a tunnel that answers: %s", row.Status)
+	}
+	if !strings.Contains(row.Detail, "connector-registered") {
+		t.Errorf("the block does not name what it is waiting for: %q", row.Detail)
+	}
+	if d := diffSnapshots(before, k.snapshot()); len(d) > 0 {
+		t.Errorf("a blocked step wrote anyway: %s", strings.Join(d, "; "))
+	}
+
+	// And the ordering is not the graph: plan-show sits below tunnel-ensure in
+	// the contract's table and does not consume it, so the last free stop can
+	// be shown while nothing has happened yet.
+	k.answer("plan-show", true)
+	if row := k.mustPass("plan-show"); !strings.Contains(row.Proof, "mail."+testDomain) {
+		t.Errorf("the plan does not name what it is about to publish: %q", row.Proof)
+	}
+}
+
+// The provider steps are defined and honest about being unwritten. Pending, not
+// failed: they are ahead of the wizard, not broken by it.
+func TestProviderStepsAreDefinedAndSayTheyAreNotWrittenYet(t *testing.T) {
+	k := newKit(t)
+	k.answer("token-verify", testToken)
+	// The local steps these wait on, stood in for so that each provider step is
+	// reached rather than blocked one row earlier. A blocked step says what it
+	// is waiting for, which is right and is checked elsewhere; what is being
+	// checked here is what each one says once it is its turn.
+	k.standIn("token-store", "plan-show", "ingress-write")
+
+	for _, id := range []string{
+		"token-verify", "zone-resolve", "nameservers", "zone-inventory",
+		"tunnel-ensure", "dns-apply", "connector-registered", "cert-wait", "nonce-probe",
+	} {
+		row := k.run(id)
+		if row.Status != ledger.Pending {
+			t.Errorf("%s: %s, expected pending — %s", id, row.Status, row.Detail)
+		}
+		if !strings.Contains(row.Detail, "not implemented yet") {
+			t.Errorf("%s does not say it is unwritten: %q", id, row.Detail)
+		}
+		if row.Desired == "" {
+			t.Errorf("%s does not say what it would do, so the page cannot show what is coming", id)
+		}
+		// Stand in for it so the next one in the chain is reached too.
+		k.standIn(id)
+	}
+	if len(k.m.unitCalls()) > 0 {
+		t.Errorf("an unimplemented step touched a service: %v", k.m.unitCalls())
+	}
+	if _, err := os.Stat(k.etc); !os.IsNotExist(err) {
+		t.Error("an unimplemented step wrote configuration")
+	}
+}
+
+func TestSkippingNeedsAReason(t *testing.T) {
+	k := newKit(t)
+	if err := k.e.Skip("engines", "   "); err == nil {
+		t.Error("a step was skipped with nothing written down about why")
+	}
+	if err := k.e.Skip("engines", "no AI on this machine"); err != nil {
+		t.Fatal(err)
+	}
+	if r := k.row("engines"); r.Status != ledger.Skipped || r.Detail != "no AI on this machine" {
+		t.Errorf("the reason was not kept: %s %q", r.Status, r.Detail)
+	}
+	if err := k.e.Skip("not-a-step", "because"); err == nil {
+		t.Error("a step that does not exist was skipped")
+	}
+}
+
+func TestWhatSomebodyPastesIntoADomainBox(t *testing.T) {
+	for _, tc := range []struct {
+		in, want, because string
+	}{
+		{in: " Example.ORG ", want: testDomain},
+		{in: testDomain + ".", want: testDomain},
+		{in: "https://" + testDomain, because: "a URL"},
+		{in: testDomain + "/setup", because: "a path"},
+		{in: testDomain + ":8443", because: "a port"},
+		{in: "localhost", because: "a single label"},
+		{in: "not a domain", because: "spaces"},
+		{in: "-bad." + testDomain, because: "a label starting with a hyphen"},
+		{in: "", because: "empty"},
+	} {
+		got, err := cleanDomain(tc.in)
+		if tc.because != "" {
+			if err == nil {
+				t.Errorf("%q was accepted despite being %s", tc.in, tc.because)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("cleanDomain(%q) = %q, %v; want %q", tc.in, got, err, tc.want)
+		}
+	}
+}
+
+// --- small helpers ---------------------------------------------------------
+
+func writeFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o640); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeJSONFile(t *testing.T, path string, v any) {
+	t.Helper()
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, string(b)+"\n")
+}
+
+func readJSONFile(t *testing.T, path string) map[string]any {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	return out
+}
+
+func mkdirWithSomethingIn(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "mail.db"), "not really a database")
+}
+
+// Two steps end in an observation of the machine rather than in a file being
+// written, and both of their unhappy branches matter more than their happy one.
+func TestTheStepsThatObserveTheMachineRatherThanWriteToIt(t *testing.T) {
+	t.Run("no administrator yet is a wait on a person, not a failure", func(t *testing.T) {
+		k := newKit(t)
+		k.m.out[k.p.Corexctl+" admin list"] = ""
+
+		row := k.run("admin")
+		if row.Status != ledger.WaitingOnThem {
+			t.Fatalf("admin is %s, and a wait on a person is not a failure", row.Status)
+		}
+		// An unattributed wait reads as this machine being slow. This one is
+		// somebody standing at a terminal, and the row has to say so.
+		if row.WaitingOn == "" {
+			t.Error("the wait names nobody")
+		}
+		if row.Needs == nil || row.Needs.Kind != "manual" || !row.Needs.Recheck {
+			t.Errorf("the row does not offer the instructions and a recheck: %+v", row.Needs)
+		}
+		if row.Needs != nil && !strings.Contains(row.Needs.Instructions, "admin create") {
+			t.Error("the instructions do not say what to run")
+		}
+		if row.Needs != nil && strings.Contains(strings.ToLower(row.Needs.Instructions), "type your password here") {
+			t.Error("the page is asking for a password over plain HTTP")
+		}
+	})
+
+	t.Run("an administrator that exists withdraws the instructions", func(t *testing.T) {
+		k := newKit(t)
+		k.mustPass("admin")
+		if row := k.row("admin"); row.Needs != nil {
+			t.Errorf("the page still tells somebody to do a thing they have done: %+v", row.Needs)
+		}
+	})
+
+	t.Run("an engine that is not on the machine is a failure, in the tool's own words", func(t *testing.T) {
+		k := newKit(t)
+		k.m.fail["run ollama --version"] = errNotThere
+		k.answer("engines", "ollama")
+
+		before := k.snapshot()
+		row := k.run("engines")
+		if row.Status != ledger.Failed {
+			t.Fatalf("engines is %s despite the engine not being installed", row.Status)
+		}
+		if !strings.Contains(row.Detail, "ollama") {
+			t.Errorf("the failure does not name what is missing: %q", row.Detail)
+		}
+		// Writing "ollama" into a config file is not evidence that ollama
+		// exists, and the failure it produces later is an app that opens and
+		// does nothing, three steps from anything that mentions engines.
+		if d := diffSnapshots(before, k.snapshot()); len(d) > 0 {
+			t.Errorf("a configuration was written for an engine that is not there: %s", strings.Join(d, "; "))
+		}
+	})
+
+	t.Run("the apex is checked while logged out", func(t *testing.T) {
+		k := newKit(t)
+		k.drive()
+		k.resp = Response{Status: 502, Body: "Bad gateway"}
+
+		row := k.run("corex-restart-2")
+		if row.Status != ledger.Failed {
+			t.Fatalf("the apex answered 502 and the step reported %s", row.Status)
+		}
+		if !strings.Contains(row.Detail, "502") {
+			t.Errorf("the failure does not carry what came back: %q", row.Detail)
+		}
+	})
+}
+
+var errNotThere = errors.New(`exec: "ollama": executable file not found in $PATH`)
+
+// The domain change, which is the same code as the first run and is the reason
+// it had to be. It is also the one write that removes something, and a removal
+// that is written without being shown is the failure this whole package is
+// built to avoid.
+func TestChangingTheDomainReportsWhatItTakesAwayAsWellAsWhatItAdds(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.mustPass("apps")
+
+	// nonce-probe's work, standing in: one hostname has answered, so coreX
+	// advertises it.
+	core := readJSONFile(t, k.p.CoreXConfig)
+	core["instance"].(map[string]any)["appOrigins"] = map[string]any{
+		"mail": "https://mail." + testDomain,
+	}
+	writeJSONFile(t, k.p.CoreXConfig, core)
+
+	const moved = "example.net"
+	k.answer("domain", moved)
+	k.mustPass("domain")
+
+	// The step has passed here before, so the old hostnames are this machine's
+	// own work rather than somebody else's — a reconcile, not a conflict.
+	row := k.mustPass("apps")
+	if row.Status != ledger.Passed {
+		t.Fatalf("a domain change was refused as a conflict: %s", row.Detail)
+	}
+
+	got := readJSONFile(t, k.p.CoreXConfig)["instance"].(map[string]any)["appOrigins"].(map[string]any)
+	if _, still := got["mail"]; still {
+		t.Errorf("an origin under the old domain survived the move: %v", got)
+	}
+	soli := readJSONFile(t, k.p.SolisuiteConfig)["apps"].([]any)
+	for _, a := range soli {
+		host := a.(map[string]any)["host"].(string)
+		if !strings.HasSuffix(host, "."+moved) {
+			t.Errorf("Solisuite still maps a hostname under the old domain: %q", host)
+		}
+	}
+
+	// And the removal was in the diff. instance.File.Changes() walks the tree
+	// it is about to write, so it cannot see a key that disappears; this is the
+	// check that the gap is covered rather than merely known about.
+	dropped := droppedOrigins(k.p.CoreXConfig,
+		map[string]any{"mail": "https://mail." + testDomain, "files": "https://files." + moved},
+		map[string]string{"files": "https://files." + moved})
+	if len(dropped) != 1 {
+		t.Fatalf("a removed origin was not reported: %+v", dropped)
+	}
+	if dropped[0].From != "https://mail."+testDomain || dropped[0].To != "(removed)" {
+		t.Errorf("the removal does not say what is going: %+v", dropped[0])
+	}
+}
