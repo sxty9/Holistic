@@ -226,3 +226,77 @@ func TestTheCatalogueCarriesTheMailIntake(t *testing.T) {
 		}
 	}
 }
+
+// The second entry the reconciler found for us. `ssh.<domain>` is how this
+// machine is reached from outside since the legacy tunnel came down, and
+// publishing a catalogue that had never heard of it would have deleted the DNS
+// record and the ingress rule for the operator's own way back in — from inside
+// a step called "which apps this instance publishes".
+//
+// The shape that matters is known-but-unchecked: a fresh instance must not
+// publish its SSH port through a public tunnel because a catalogue said so, and
+// an instance that already does must not lose it because the catalogue was
+// silent.
+func TestSSHIsKnownAndOffByDefault(t *testing.T) {
+	var found *App
+	for i := range Default() {
+		if Default()[i].ID == "ssh" {
+			a := Default()[i]
+			found = &a
+		}
+	}
+	if found == nil {
+		t.Fatal("no ssh in the catalogue: publishing the list deletes the operator's own way in")
+	}
+	if found.Enabled {
+		t.Error("ssh is enabled by default, so a fresh instance publishes its shell without being asked")
+	}
+	if found.Required {
+		t.Error("ssh is Required, so it cannot be turned off — an instance with no remote shell is fine")
+	}
+	if !found.Standalone {
+		t.Error("ssh is not Standalone, so Solisuite would be asked to serve a document for it")
+	}
+	if !strings.HasPrefix(found.Upstream, "ssh://") {
+		t.Errorf("ssh upstream is %q; cloudflared proxies the stream to sshd, it is not http", found.Upstream)
+	}
+
+	// Unchecked means absent from every projection until somebody ticks it.
+	c := New("example.org", Default())
+	for _, w := range c.Warpgate() {
+		if w.Name == "ssh" {
+			t.Error("ssh reached the Warpgate projection while unchecked")
+		}
+	}
+	for _, s := range c.Solisuite() {
+		if s.ID == "ssh" {
+			t.Error("ssh reached Solisuite's app list, which has no document for it")
+		}
+	}
+
+	// Ticked, it must reach Warpgate and only Warpgate.
+	apps := Default()
+	for i := range apps {
+		if apps[i].ID == "ssh" {
+			apps[i].Enabled = true
+		}
+	}
+	on := New("example.org", apps)
+	var inWarpgate bool
+	for _, w := range on.Warpgate() {
+		if w.Name == "ssh" {
+			inWarpgate = true
+			if w.Upstream != "ssh://localhost:22" {
+				t.Errorf("published ssh upstream is %q", w.Upstream)
+			}
+		}
+	}
+	if !inWarpgate {
+		t.Error("ssh was ticked and no hostname is published for it")
+	}
+	for _, s := range on.Solisuite() {
+		if s.ID == "ssh" {
+			t.Error("a ticked ssh reached Solisuite's app list")
+		}
+	}
+}

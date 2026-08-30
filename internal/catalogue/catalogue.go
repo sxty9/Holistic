@@ -87,6 +87,26 @@ func Default() []App {
 		// which is the exact failure this whole project was started over.
 		{ID: "routedge", Label: "Mail intake", Upstream: routedge, Enabled: true, Standalone: true, Required: true,
 			Note: "Where incoming mail arrives. Nobody opens it; without it, nothing arrives."},
+		// The second entry found the same way routedge was: the wizard refused
+		// to publish a list that would have deleted `ssh` from Warpgate's live
+		// configuration — and `ssh.<domain>` is how this machine is reached
+		// from outside since the legacy tunnel was taken down. Deleting it
+		// would have removed the DNS record and the ingress rule for the
+		// operator's own way back in, from inside a step called "which apps
+		// this instance publishes".
+		//
+		// Off by default, and that is the whole point of it being here. A fresh
+		// instance must not publish its SSH port through a public tunnel
+		// because a catalogue said so; an instance that already does must not
+		// lose it because the catalogue had never heard of it. An entry that is
+		// known and unchecked is the only shape that satisfies both.
+		//
+		// Standalone: cloudflared hands this straight to sshd, and Solisuite
+		// has no document to serve for it. Not Required: an instance with no
+		// remote SSH is a perfectly good instance.
+		{ID: "ssh", Label: "SSH", Upstream: sshd, Standalone: true,
+			Note: "Reach this machine's shell through the tunnel. Off unless you want it published; " +
+				"you still need `cloudflared access` on the other end."},
 	}
 }
 
@@ -96,7 +116,9 @@ func Default() []App {
 const (
 	solisuite = "http://127.0.0.1:8795"
 	roomsense = "http://127.0.0.1:8797"
-	routedge  = "http://127.0.0.1:8793"
+	// Not http. cloudflared proxies the TCP stream to sshd itself.
+	sshd     = "ssh://localhost:22"
+	routedge = "http://127.0.0.1:8793"
 )
 
 // Catalogue is the decision, plus the domain it is expressed under.
