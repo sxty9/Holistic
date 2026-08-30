@@ -268,6 +268,8 @@ func stepZoneInventory() Step {
 			if err != nil {
 				return failed("the zone could not be read: " + err.Error())
 			}
+			e.given.records = recs
+
 			// One line per record, in the zone file's own shape. It is written
 			// into the ledger as the proof, which means it survives this
 			// process and can be read back after everything has changed.

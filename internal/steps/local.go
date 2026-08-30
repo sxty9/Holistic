@@ -751,11 +751,48 @@ func plan(e *Engine) []Change {
 	if ref := e.tunnelRef(); ref != "" {
 		target = ref + ".cfargotunnel.com"
 	}
+	// What the zone already holds, from the snapshot zone-inventory took. Read
+	// so that a hostname which is already published shows as unchanged rather
+	// than as a creation.
+	//
+	// This screen said "11 records will be created" on a zone that already had
+	// ten of them, and one of the two questions it exists to answer is how much
+	// is about to change. An operator confirming that was not being shown the
+	// truth. Seen on 2026-08-30, where Warpgate's own plan was one record.
+	live := map[string]string{}
+	ours := map[string]bool{}
+	for _, r := range e.given.records {
+		if r.Type != "CNAME" && r.Type != "A" && r.Type != "AAAA" {
+			continue
+		}
+		live[strings.ToLower(r.Name)] = r.Type + " " + r.Content
+		if r.Ours() {
+			ours[strings.ToLower(r.Name)] = true
+		}
+	}
+
 	var out []Change
+	wanted := map[string]bool{}
 	for _, a := range c.Enabled() {
+		host := c.Hostname(a.ID)
+		wanted[strings.ToLower(host)] = true
 		out = append(out, Change{
-			Path: "DNS      " + c.Hostname(a.ID),
+			Path: "DNS      " + host,
+			From: live[strings.ToLower(host)],
 			To:   "CNAME to " + target + ", proxied",
+		})
+	}
+	// A name this instance published and no longer wants. Warpgate deletes only
+	// what carries its own marker, so these are the only records that can go —
+	// and a deletion is the one thing on this screen nobody may miss.
+	for name := range ours {
+		if wanted[name] || name == strings.ToLower(c.Domain) {
+			continue
+		}
+		out = append(out, Change{
+			Path: "DNS      " + name + "  — REMOVED",
+			From: live[name],
+			To:   "deleted, because no app in the list publishes this name",
 		})
 	}
 	for _, a := range c.Enabled() {
@@ -789,12 +826,23 @@ func quoteBool(v any) string {
 
 func stepIngressWrite() Step {
 	return Step{
-		ID:    "ingress-write",
-		Title: "The ingress, and the connector",
+		ID: "ingress-write",
+		// Renamed in substance if not in id: this step used to WRITE the
+		// ingress file, as JSON, with openEdit. It is Warpgate's file and it is
+		// YAML, so the wizard was a second writer producing something
+		// cloudflared cannot read. Seen live on 2026-08-30: after `warpgate
+		// apply` had written a correct ingress.yml, this step failed with
+		// "invalid character '#' looking for beginning of value" — the '#' was
+		// the comment on line 1 of the YAML.
+		//
+		// It reads the file now and starts the connector. Which is what the
+		// rule at the top of cloudflare.go already said: Warpgate owns the
+		// edge, and every write in this wizard runs `warpgate`.
+		Title: "The connector",
 		Kind:  Local,
-		After: []string{"warpgate-config"},
+		After: []string{"dns-apply"},
 		desired: func(e *Engine) string {
-			return fmt.Sprintf("write the hostname-to-upstream map to %s, then enable AND start %s",
+			return fmt.Sprintf("check that %s carries every hostname, then enable AND start %s",
 				e.paths.WarpgateIngress, e.paths.ConnectorUnit)
 		},
 		run: func(e *Engine) result {
@@ -802,56 +850,54 @@ func stepIngressWrite() Step {
 			if err := c.Validate(); err != nil {
 				return failed(err.Error())
 			}
-			ed, err := openEdit(e.paths.WarpgateIngress, confMode)
+			raw, err := os.ReadFile(e.paths.WarpgateIngress)
 			if err != nil {
-				return failed(err.Error())
+				return failed(fmt.Sprintf("%s is not there: %v. `warpgate apply` writes it, and dns-apply "+
+					"is what runs that — so this means the previous step did not do what it reported.",
+					e.paths.WarpgateIngress, err))
 			}
-			rules := make([]map[string]string, 0, len(c.Enabled())+1)
-			for _, a := range c.Enabled() {
-				rules = append(rules, map[string]string{"hostname": c.Hostname(a.ID), "service": a.Upstream})
-			}
-			// The catch-all is not decoration. Without a final rule the
-			// connector has no answer for a hostname that is not in the list,
-			// and "no answer" from an edge that terminates TLS for a whole
-			// domain is a far worse thing to serve than a 404.
-			rules = append(rules, map[string]string{"service": "http_status:404"})
-			ed.set("ingress", rules)
-			if ref := e.tunnelRef(); ref != "" {
-				ed.set("tunnel", ref)
-			}
-
-			changed := len(ed.changes()) > 0
-			if changed {
-				if err := applyAll([]*edit{ed}); err != nil {
-					return failed(err.Error())
+			// Matched as text rather than parsed. The file is cloudflared's
+			// YAML, this package has no YAML reader, and adding one to ask
+			// "is this hostname in here" would be a second opinion about a
+			// format Warpgate already owns.
+			text := string(raw)
+			var absent []string
+			for _, h := range c.Hostnames() {
+				if !strings.Contains(text, h) {
+					absent = append(absent, h)
 				}
+			}
+			if len(absent) > 0 {
+				return failed(fmt.Sprintf("%s does not mention %s. Run the DNS step again; "+
+					"`warpgate apply` writes this file and it is the only thing that should.",
+					e.paths.WarpgateIngress, strings.Join(absent, ", ")))
+			}
+			if !strings.Contains(text, "http_status:404") {
+				// Without a final rule the connector has no answer for a
+				// hostname that is not in the list, and "no answer" from an
+				// edge that terminates TLS for a whole domain is worse to
+				// serve than a 404.
+				return failed(e.paths.WarpgateIngress + " has no catch-all rule, so any hostname not listed " +
+					"gets no answer at all from an edge that holds this domain's certificate")
 			}
 
 			// Enabled AND started. A connector that is running but not enabled
 			// is an instance that is on the internet until the next power cut,
 			// and nothing about it looks wrong until then.
 			unit := e.paths.ConnectorUnit
-			switch {
-			case !e.machine.IsEnabled(unit) || !e.machine.IsActive(unit):
+			if !e.machine.IsEnabled(unit) || !e.machine.IsActive(unit) {
 				if err := e.machine.EnableNow(unit); err != nil {
-					return failed(err.Error())
-				}
-			case changed:
-				if err := e.machine.Restart(unit); err != nil {
 					return failed(err.Error())
 				}
 			}
 			if !e.machine.IsActive(unit) {
 				return failed(unit + " is not running after being started")
 			}
-			detail := "already as wanted"
-			if changed {
-				detail = fmt.Sprintf("%d ingress rules", len(rules))
-			}
-			return passed(detail, fmt.Sprintf(
-				"%s holds %d rules ending in a 404 catch-all, and %s is enabled and active. "+
-					"That the unit is active is NOT proof the tunnel is registered — connector-registered is.",
-				e.paths.WarpgateIngress, len(rules), unit))
+			return passed(fmt.Sprintf("%d hostname(s) routed", len(c.Hostnames())), fmt.Sprintf(
+				"%s names every hostname in the catalogue and ends in a 404 catch-all, and %s is enabled "+
+					"and active. That the unit is active is NOT proof the tunnel is registered — "+
+					"connector-registered is.",
+				e.paths.WarpgateIngress, unit))
 		},
 	}
 }

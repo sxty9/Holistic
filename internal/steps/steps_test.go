@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -181,7 +182,10 @@ func newKit(t *testing.T) *kit {
 		SolisuiteConfig: filepath.Join(etc, "solisuite", "config.json"),
 		SolisuiteEnv:    filepath.Join(etc, "solisuite", "solisuite.env"),
 		WarpgateConfig:  filepath.Join(etc, "warpgate", "config.json"),
-		WarpgateIngress: filepath.Join(etc, "warpgate", "ingress.json"),
+		// .yml, and cloudflared's YAML. The kit said ingress.json, which is
+		// the same wrong belief the step held — so the step could write JSON
+		// and the test could read it back and agree.
+		WarpgateIngress: filepath.Join(etc, "warpgate", "ingress.yml"),
 		WarpgateToken:   filepath.Join(etc, "warpgate", "cloudflare.token"),
 		CoreXUnit:       "corex-api.test",
 		SolisuiteUnit:   "solisuite.test",
@@ -267,6 +271,26 @@ func (k *kit) standIn(ids ...string) {
 
 const testToken = "cf-Zq7Z4mR2xLp9vT1nB8kW6yH3jD5sG0aEQhVuJcRt"
 
+// writeIngress puts down what `warpgate apply` would have written: cloudflared's
+// YAML, one rule per hostname, ending in the catch-all. A comment on line 1,
+// because that is what the real file has and it is what broke the step that
+// used to parse this as JSON.
+func (k *kit) writeIngress() {
+	k.t.Helper()
+	var b strings.Builder
+	b.WriteString("# Written by warpgate. Do not edit.\ntunnel: test-tunnel\ningress:\n")
+	for _, a := range k.e.catalogue().Enabled() {
+		fmt.Fprintf(&b, "  - hostname: %s\n    service: %s\n", k.e.catalogue().Hostname(a.ID), a.Upstream)
+	}
+	b.WriteString("  - service: http_status:404\n")
+	if err := os.MkdirAll(filepath.Dir(k.p.WarpgateIngress), 0o755); err != nil {
+		k.t.Fatal(err)
+	}
+	if err := os.WriteFile(k.p.WarpgateIngress, []byte(b.String()), 0o644); err != nil {
+		k.t.Fatal(err)
+	}
+}
+
 // drive takes the wizard as far as it goes, standing in only for the steps that
 // talk to a provider.
 func (k *kit) drive() {
@@ -290,6 +314,10 @@ func (k *kit) drive() {
 	k.mustPass("warpgate-config")
 	k.answer("plan-show", true)
 	k.mustPass("plan-show")
+	// dns-apply runs `warpgate apply`, and that is what writes the ingress
+	// file. Standing in for the step means standing in for its effect too.
+	k.writeIngress()
+	k.standIn("dns-apply")
 	k.mustPass("ingress-write")
 
 	k.standIn("connector-registered")
@@ -1360,4 +1388,171 @@ func contains(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// This step used to WRITE the ingress file, as JSON, with openEdit — while
+// Warpgate owns that file and writes it as cloudflared's YAML. Two writers for
+// one file, and the wizard's produced something cloudflared cannot read. Seen
+// live on 2026-08-30: after `warpgate apply` had written a correct ingress.yml,
+// the step failed with "invalid character '#' looking for beginning of value",
+// the '#' being the comment on line 1.
+//
+// The test kit held the same belief — it called the file ingress.json — so the
+// step could write JSON and the kit could read it back and agree.
+func TestTheIngressFileIsReadNotWritten(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+
+	before, err := os.ReadFile(k.p.WarpgateIngress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(before), "#") {
+		t.Fatalf("the kit no longer writes what warpgate writes: %.40q", before)
+	}
+	k.run("ingress-write")
+	after, err := os.ReadFile(k.p.WarpgateIngress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("the step rewrote Warpgate's file:\n  was %.80q\n  now %.80q", before, after)
+	}
+}
+
+// A hostname the catalogue publishes and the ingress file does not name means
+// `warpgate apply` did not do what dns-apply reported. Starting the connector
+// then puts a name into DNS that the edge has no answer for.
+func TestAMissingHostnameInTheIngressStopsTheConnector(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+
+	raw, err := os.ReadFile(k.p.WarpgateIngress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := k.e.catalogue().Hostname("gallery")
+	cut := strings.ReplaceAll(string(raw), host, "somethingelse.invalid")
+	if cut == string(raw) {
+		t.Fatalf("%s was not in the ingress file to begin with", host)
+	}
+	if err := os.WriteFile(k.p.WarpgateIngress, []byte(cut), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	row := k.run("ingress-write")
+	if row.Status != ledger.Failed {
+		t.Fatalf("a hostname with no ingress rule was accepted: %s %s", row.Status, row.Detail)
+	}
+	if !strings.Contains(row.Detail, host) {
+		t.Errorf("the failure does not name the hostname that is missing: %q", row.Detail)
+	}
+}
+
+// Without a final rule the connector has no answer for a hostname that is not
+// listed, and no answer from an edge holding this domain's certificate is worse
+// to serve than a 404.
+func TestAnIngressWithNoCatchAllIsRefused(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+
+	raw, err := os.ReadFile(k.p.WarpgateIngress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut := strings.ReplaceAll(string(raw), "  - service: http_status:404\n", "")
+	if cut == string(raw) {
+		t.Fatal("the kit wrote no catch-all to remove")
+	}
+	if err := os.WriteFile(k.p.WarpgateIngress, []byte(cut), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if row := k.run("ingress-write"); row.Status != ledger.Failed {
+		t.Fatalf("an ingress with no catch-all was accepted: %s %s", row.Status, row.Detail)
+	}
+}
+
+// A connector that runs but is not enabled is an instance that is on the
+// internet until the next power cut, and nothing about it looks wrong until
+// then. It is also plan item 7.6 #3, found in install.sh before the wizard
+// existed: `reload-or-restart` starts a unit and does not enable it.
+//
+// The condition has to test both. Testing IsActive alone passes on a machine
+// where somebody started the connector by hand, and no other check in this file
+// noticed when that half was removed.
+func TestAConnectorThatRunsButIsNotEnabledIsEnabled(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+
+	unit := k.p.ConnectorUnit
+	k.m.mu.Lock()
+	k.m.active[unit] = true
+	k.m.enabled[unit] = false
+	k.m.calls = nil
+	k.m.mu.Unlock()
+
+	if row := k.run("ingress-write"); row.Status != ledger.Passed {
+		t.Fatalf("the step failed: %s %s", row.Status, row.Detail)
+	}
+	if !contains(k.m.calls, "enable-now "+unit) {
+		t.Errorf("a running-but-not-enabled connector was left that way; calls = %v. "+
+			"It survives until the next reboot and nothing looks wrong until then.", k.m.calls)
+	}
+}
+
+// The confirmation screen is the last free stop before anything reaches public
+// DNS, and it presented every hostname as a creation. On this machine it said
+// eleven records would be created on a zone that already held ten of them,
+// while Warpgate's own plan was one record. An operator confirming that was not
+// shown what would change.
+func TestTheConfirmationScreenSaysWhatIsAlreadyThere(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.answer("apps", []appChoice{{ID: "gallery", On: true}})
+	k.mustPass("apps")
+
+	c := k.e.catalogue()
+	existing := c.Hostname("gallery")
+	k.cf.records = []DNSRecord{
+		{Type: "CNAME", Name: existing, Content: "tunnel-1.cfargotunnel.com", Proxied: true,
+			Comment: "warpgate:v1:" + testDomain + ":app:gallery"},
+		// One this instance published for an app nobody selected. It is the
+		// only kind of record Warpgate may delete, and the one line on this
+		// screen that must not be missable.
+		{Type: "CNAME", Name: "wiki." + testDomain, Content: "tunnel-1.cfargotunnel.com", Proxied: true,
+			Comment: "warpgate:v1:" + testDomain + ":app:wiki"},
+	}
+	k.answer("token-verify", testToken)
+	k.mustPass("token-verify")
+	k.mustPass("zone-resolve")
+	k.mustPass("token-store")
+	k.mustPass("zone-inventory")
+	k.mustPass("warpgate-config")
+
+	need := k.row("plan-show").Needs
+	if need == nil {
+		t.Fatal("the confirmation screen asks for nothing")
+	}
+	var seenExisting, seenRemoval bool
+	for _, ch := range need.Changes {
+		if strings.HasPrefix(ch.Path, "DNS") && strings.Contains(ch.Path, existing) {
+			seenExisting = true
+			if ch.From == "" {
+				t.Errorf("%s is already published and is shown as a creation: %+v", existing, ch)
+			}
+		}
+		if strings.Contains(ch.Path, "wiki."+testDomain) {
+			seenRemoval = true
+			if !strings.Contains(ch.Path, "REMOVED") && !strings.Contains(ch.To, "deleted") {
+				t.Errorf("a record that will be deleted is not labelled as one: %+v", ch)
+			}
+		}
+	}
+	if !seenExisting {
+		t.Errorf("%s is not on the screen at all", existing)
+	}
+	if !seenRemoval {
+		t.Error("a record this instance published and no longer wants is not on the screen; " +
+			"a deletion is the one thing here nobody may miss")
+	}
 }

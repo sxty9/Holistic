@@ -51,7 +51,13 @@ type given struct {
 	// zone is what Cloudflare answered about the domain, kept so the steps
 	// after zone-resolve do not each ask again — and so a re-run of a later
 	// step does not depend on the network being up.
-	zone    Zone
+	zone Zone
+	// records is the zone as zone-inventory read it, kept so the confirmation
+	// screen can say what is ALREADY there instead of presenting every
+	// hostname as new. It is a snapshot, not a live view, and the step that
+	// applies is Warpgate — which computes its own plan against the zone at
+	// the moment it writes.
+	records []DNSRecord
 	dataDir string
 	engine  string
 	// apps is an overlay on the catalogue defaults rather than a replacement,
