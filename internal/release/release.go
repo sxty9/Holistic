@@ -169,6 +169,22 @@ func (c *Client) Fetch(dir, platform, version string) (*Release, error) {
 		return nil, errors.New("the archive does not look like a Holistic release")
 	}
 
+	// The tag that was asked for is not the version that arrived: "latest" is a
+	// request, not an answer. release.sh has written holistic/VERSION into the
+	// archive since v0.1.0 for exactly this, and until 2026-08-30 nothing read
+	// it — so every upgrade through /latest/download recorded the string
+	// "latest" as the installed version, and `holistic version` reported it
+	// back. A machine that cannot say which release it is running cannot be
+	// told whether it has the fix.
+	//
+	// A release without the file is one of the first two, from before it
+	// existed; the requested ref is then the best that can be said.
+	if b, err := os.ReadFile(filepath.Join(dir, "holistic", "VERSION")); err == nil {
+		if v := strings.TrimSpace(string(b)); v != "" {
+			version = v
+		}
+	}
+
 	return &Release{Version: version, Platform: platform, Dir: dir, Archive: archive, SHA256: want}, nil
 }
 

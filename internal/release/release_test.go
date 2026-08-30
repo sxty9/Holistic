@@ -78,6 +78,7 @@ func goodRelease() map[string]string {
 		"holistic/bin/holistic":       "#!/bin/true\n",
 		"holistic/bin/holistic-setup": "#!/bin/true\n",
 		"holistic/deploy/x.service":   "[Unit]\n",
+		"holistic/VERSION":            "v9.9.9\n",
 	}
 }
 
@@ -248,5 +249,38 @@ func TestChecksumOfAcceptsBothManifestForms(t *testing.T) {
 	}
 	if _, err := checksumOf(m, "absent.tar.gz"); err == nil {
 		t.Error("a file absent from the manifest was accepted")
+	}
+}
+
+// "latest" is a request, not an answer. An upgrade that records it as the
+// installed version leaves a machine that cannot say which release it runs, and
+// so cannot be told whether it has a given fix.
+func TestTheVersionRecordedIsTheOneThatArrived(t *testing.T) {
+	f := buildRelease(t, goodRelease())
+	url := f.serve(t)
+
+	rel, err := f.client(url).Fetch(t.TempDir(), "linux-amd64", "latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.Version != "v9.9.9" {
+		t.Errorf("Version = %q, want v9.9.9 — the tag asked for was recorded instead of the one in the archive", rel.Version)
+	}
+}
+
+// The first two releases predate the VERSION file. Saying "latest" is worse
+// than saying the tag, and inventing one would be worse than both.
+func TestAReleaseWithoutAVersionFileFallsBackToTheRefAsked(t *testing.T) {
+	e := goodRelease()
+	delete(e, "holistic/VERSION")
+	f := buildRelease(t, e)
+	url := f.serve(t)
+
+	rel, err := f.client(url).Fetch(t.TempDir(), "linux-amd64", "latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.Version != "latest" {
+		t.Errorf("Version = %q, want the requested ref back", rel.Version)
 	}
 }
