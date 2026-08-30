@@ -24,6 +24,7 @@ type inertMachine struct{}
 
 func (inertMachine) Restart(string) error                  { return nil }
 func (inertMachine) EnableNow(string) error                { return nil }
+func (inertMachine) Disable(string) error                  { return nil }
 func (inertMachine) IsActive(string) bool                  { return true }
 func (inertMachine) IsEnabled(string) bool                 { return true }
 func (inertMachine) Run(string, ...string) (string, error) { return "", nil }

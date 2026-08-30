@@ -101,6 +101,12 @@ func (r *recorder) EnableNow(unit string) error {
 	return nil
 }
 
+func (r *recorder) Disable(unit string) error {
+	r.note("disable " + unit)
+	r.active[unit] = false
+	return nil
+}
+
 func (r *recorder) IsActive(unit string) bool  { return r.active[unit] }
 func (r *recorder) IsEnabled(unit string) bool { return r.enabled[unit] }
 
@@ -157,6 +163,9 @@ func newKit(t *testing.T) *kit {
 		SolisuiteUnit:   "solisuite.test",
 		ConnectorUnit:   "warpgate.test",
 		WarpgateBin:     "warpgate-that-is-recorded-not-run",
+		Seal:            filepath.Join(etc, "holistic", "claimed"),
+		Claim:           filepath.Join(etc, "holistic", "setup.claim"),
+		SetupUnit:       "holistic-setup.test",
 		Corexctl:        "corexctl-that-is-never-executed",
 		DataDir:         filepath.Join(d, "data"),
 	}
@@ -1023,5 +1032,91 @@ func TestChangingTheDomainReportsWhatItTakesAwayAsWellAsWhatItAdds(t *testing.T)
 	}
 	if dropped[0].From != "https://mail."+testDomain || dropped[0].To != "(removed)" {
 		t.Errorf("the removal does not say what is going: %+v", dropped[0])
+	}
+}
+
+// Closing setup is one act, and the order inside it is the whole design.
+//
+// Plan 7.7: the same transaction that records the instance as claimed destroys
+// the setup code and takes the LAN listener away. Never both doors open at
+// once — an instance live on its own domain and still answering an
+// unauthenticated setup page on the network is the shape of Jellyfin #6486.
+func TestClosingSetupIsOneAct(t *testing.T) {
+	k := newKit(t)
+	if err := os.MkdirAll(filepath.Dir(k.p.Claim), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(k.p.Claim, []byte("a-code\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	// It refuses while anything is unfinished — and the case that matters is
+	// NOT the one the dependency graph already covers. `After` names
+	// corex-restart-2 alone, so standing everything in except a step in the
+	// middle reaches the guard rather than the graph. The first version of this
+	// check stood in nothing, was blocked by After, and passed with the guard
+	// deleted.
+	k.answer("seal", true)
+	for _, st := range k.e.order {
+		if st.ID != "seal" && st.ID != "zone-inventory" {
+			k.standIn(st.ID)
+		}
+	}
+	row := k.run("seal")
+	if row.Status == ledger.Passed {
+		t.Fatal("setup was closed with zone-inventory still open")
+	}
+	if !strings.Contains(row.Detail, "zone-inventory") {
+		t.Errorf("the refusal does not name what is unfinished: %q", row.Detail)
+	}
+	if _, err := os.Stat(k.p.Seal); err == nil {
+		t.Fatal("it wrote the seal anyway")
+	}
+	if _, err := os.Stat(k.p.Claim); err != nil {
+		t.Error("it destroyed the setup code without closing setup")
+	}
+
+	// Now everything is finished, one way or the other.
+	k.standIn("zone-inventory")
+	row = k.run("seal")
+	if row.Status != ledger.Passed {
+		t.Fatalf("seal: %s — %s", row.Status, row.Detail)
+	}
+	if _, err := os.Stat(k.p.Seal); err != nil {
+		t.Error("setup reported closed and nothing records the instance as claimed")
+	}
+	if _, err := os.Stat(k.p.Claim); !os.IsNotExist(err) {
+		t.Error("the setup code survived: a spent code in /etc is a second key to an open door")
+	}
+	var disabled bool
+	for _, c := range k.m.calls {
+		if c == "disable "+k.p.SetupUnit {
+			disabled = true
+		}
+	}
+	if !disabled {
+		t.Errorf("the setup listener was not disabled, so it returns at the next boot. Calls: %v", k.m.calls)
+	}
+}
+
+// Without the confirmation, nothing happens. The default is no.
+func TestSetupIsNotClosedWithoutBeingAsked(t *testing.T) {
+	k := newKit(t)
+	if err := os.MkdirAll(filepath.Dir(k.p.Claim), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(k.p.Claim, []byte("a-code\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range k.e.order {
+		if s.ID != "seal" {
+			k.standIn(s.ID)
+		}
+	}
+	if row := k.run("seal"); row.Status == ledger.Passed {
+		t.Error("setup closed itself without being told to")
+	}
+	if _, err := os.Stat(k.p.Seal); err == nil {
+		t.Error("it wrote the seal without being told to")
 	}
 }

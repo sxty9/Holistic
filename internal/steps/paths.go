@@ -44,6 +44,14 @@ type Paths struct {
 	// reloadUnit and what ingress-write enables and starts.
 	ConnectorUnit string
 
+	// Seal records that setup finished, Claim is the setup code, and SetupUnit
+	// is the listener. All three are named here because the act that closes
+	// setup touches all three at once, and a path it guessed at would be a path
+	// that half-closes it.
+	Seal      string
+	Claim     string
+	SetupUnit string
+
 	// Corexctl is the instance's own command line. Administrators are created
 	// through it, on the machine, over stdin — never in a page served over
 	// plain HTTP on a name anyone on the network can claim.
@@ -81,6 +89,9 @@ func DefaultPaths() Paths {
 		// wrong one meant every reload would have restarted nothing, and
 		// `is-active` would have answered about a unit that does not exist.
 		ConnectorUnit: "cloudflared-warpgate.service",
+		Seal:          "/etc/holistic/claimed",
+		Claim:         "/etc/holistic/setup.claim",
+		SetupUnit:     "holistic-setup.service",
 		Corexctl:      "corexctl",
 		DataDir:       "/var/lib/corex",
 	}

@@ -59,6 +59,7 @@ type given struct {
 	// five it did not mention.
 	apps   map[string]bool
 	planOK bool
+	sealOK bool
 }
 
 // New builds the engine and reads the machine before it is asked anything.

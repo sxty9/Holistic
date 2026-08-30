@@ -27,6 +27,10 @@ type Machine interface {
 	// running but not enabled is an instance that is on the internet until the
 	// next power cut.
 	EnableNow(unit string) error
+	// Disable stops a unit and keeps it from coming back at the next boot.
+	// Both halves: a setup listener that was stopped but not disabled is a
+	// listener that returns the first time the machine loses power.
+	Disable(unit string) error
 	IsActive(unit string) bool
 	IsEnabled(unit string) bool
 	// Run executes a command and returns its combined output. The output is
@@ -58,6 +62,14 @@ func (systemd) EnableNow(unit string) error {
 
 // is-active and is-enabled exit non-zero for anything that is not, which is the
 // question being asked, so the exit code is the answer.
+func (systemd) Disable(unit string) error {
+	out, err := exec.Command("systemctl", "disable", "--now", unit).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s could not be stopped and disabled: %v\n%s", unit, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func (systemd) IsActive(unit string) bool {
 	return exec.Command("systemctl", "is-active", "--quiet", unit).Run() == nil
 }

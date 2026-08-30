@@ -44,5 +44,6 @@ func definitions() []Step {
 		stepCertWait(),
 		stepNonceProbe(),
 		stepCoreXRestart2(),
+		stepSeal(),
 	}
 }

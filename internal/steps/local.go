@@ -8,8 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"encoding/json"
 	"github.com/sxty9/Holistic/internal/catalogue"
 	"github.com/sxty9/Holistic/internal/instance"
+	"github.com/sxty9/Holistic/internal/ledger"
 )
 
 // Configuration files are written 0640. The service accounts read them; nobody
@@ -1136,4 +1138,90 @@ func processOverrides(watched map[string]string) []instance.Override {
 func notEmptyDir(path string) bool {
 	entries, err := os.ReadDir(path)
 	return err == nil && len(entries) > 0
+}
+
+// stepSeal is the last one, and it is a transaction rather than a step.
+//
+// Plan 7.7: the same act that records this instance as claimed destroys the
+// setup code and takes the LAN listener away. Never both doors open at once —
+// an instance that is live on its own domain and still answering an
+// unauthenticated setup page on the network is the shape of Jellyfin #6486, and
+// of every other product on that list.
+//
+// Destroyed, not marked used. A spent code lying in /etc is a second key to a
+// door that is already open, and "used: true" is a flag some later branch can
+// read the wrong way.
+func stepSeal() Step {
+	return Step{
+		ID:    "seal",
+		Title: "Close setup",
+		Kind:  Local,
+		// Everything, because this is the act that makes the rest unreachable.
+		After: []string{"corex-restart-2"},
+		desired: fixed("record this instance as claimed, destroy the setup code, and stop answering setup on " +
+			"the local network. This is one act: never both doors open at once."),
+		need: func(e *Engine) *Need {
+			if e.ours("seal") {
+				return nil
+			}
+			return &Need{
+				Kind:  "confirm",
+				Label: "Close setup",
+				Help: "After this, this address serves a status page and nothing else. Signing in happens on " +
+					"your own domain. Re-opening setup is a separate, deliberate act on the machine itself.",
+				Changes: []Change{
+					{Path: "the setup code", From: "on disk", To: "destroyed"},
+					{Path: "this address", From: "the wizard", To: "a status page"},
+					{Path: "holistic-setup.service", From: "enabled", To: "disabled"},
+				},
+			}
+		},
+		accept: func(e *Engine, raw json.RawMessage) error {
+			var ok bool
+			if err := json.Unmarshal(raw, &ok); err != nil || !ok {
+				return fmt.Errorf("%w: setup is closed only on a yes", ErrBadAnswer)
+			}
+			e.given.sealOK = true
+			return nil
+		},
+		run: func(e *Engine) result {
+			if !e.given.sealOK {
+				return blocked("waiting to be told to close setup")
+			}
+			// Refuses while anything is unfinished. Sealing over a conflict
+			// would leave the operator with a half-built instance and no way
+			// back in except a deliberate re-open on the machine.
+			var open []string
+			for _, st := range e.order {
+				if st.ID == "seal" {
+					continue
+				}
+				switch e.led.Status(st.ID) {
+				case ledger.Passed, ledger.Skipped:
+				default:
+					open = append(open, st.ID)
+				}
+			}
+			if len(open) > 0 {
+				return blocked("not while these are unfinished: " + strings.Join(open, ", ") +
+					". Skip a step deliberately if it is not wanted.")
+			}
+
+			// The seal first. If anything after it fails, the instance is
+			// claimed and the listener is still up — recoverable. The other
+			// order leaves a machine with no code, no seal and no way in.
+			if err := os.WriteFile(e.paths.Seal, []byte(e.now().UTC().Format(time.RFC3339)+"\n"), 0o644); err != nil {
+				return failed("the seal could not be written: " + err.Error())
+			}
+			if err := os.Remove(e.paths.Claim); err != nil && !os.IsNotExist(err) {
+				return failed("this instance is sealed, but the setup code could not be destroyed: " + err.Error())
+			}
+			if err := e.machine.Disable(e.paths.SetupUnit); err != nil {
+				return failed("this instance is sealed and its code is gone, but the setup service is still " +
+					"enabled and will come back on the next boot: " + err.Error())
+			}
+			return passed("setup is closed",
+				e.paths.Seal+" written, "+e.paths.Claim+" destroyed, "+e.paths.SetupUnit+" disabled")
+		},
+	}
 }
