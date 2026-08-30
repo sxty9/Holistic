@@ -127,8 +127,11 @@ type Conflict struct {
 	Found  string `json:"found"`
 	// FoundNote is how it can be told that the thing is not ours — a TTL, a
 	// missing comment, an owner. Quoted rather than paraphrased.
-	FoundNote   string `json:"foundNote,omitempty"`
-	Desired     string `json:"desired"`
+	FoundNote string `json:"foundNote,omitempty"`
+	Desired   string `json:"desired"`
+	// Summary is the one line the ledger row carries. Empty means "<object> is
+	// already there", which fits a record and not a credential.
+	Summary     string `json:"-"`
 	Why         string `json:"why"`
 	Unchanged   string `json:"unchanged"`
 	Resolution  string `json:"resolution"`
@@ -245,9 +248,21 @@ func waitingOnThem(detail string) result {
 // can produce a conflict without it.
 func held(c Conflict) result {
 	c.Unchanged = Unchanged
+	// The summary line, when the default does not fit.
+	//
+	// "<object> is already there" is right for a record or a file and wrong for
+	// everything else. Live, on the first real run, token-verify's conflict read
+	// "the Cloudflare API token, on example.org is already there" — which is
+	// true of every token that exists and says nothing about the permission it
+	// is missing. A row somebody reads at a glance has to be about the thing
+	// that is wrong.
+	summary := c.Summary
+	if summary == "" {
+		summary = c.Object + " is already there."
+	}
 	return result{
 		status:   ledger.Conflict,
-		detail:   c.Object + " is already there. " + Unchanged,
+		detail:   summary + " " + Unchanged,
 		conflict: &c,
 	}
 }

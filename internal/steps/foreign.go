@@ -95,6 +95,7 @@ func stepTokenVerify() Step {
 					want = append(want, m.Label)
 				}
 				return held(Conflict{
+					Summary:   "the Cloudflare token cannot do everything this instance needs on " + z.Name + ".",
 					Object:    "the Cloudflare API token, on " + z.Name,
 					Found:     strings.Join(z.Permissions, ", "),
 					FoundNote: "what this token can do on this zone, from the zone's own answer",
