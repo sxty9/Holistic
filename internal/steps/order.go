@@ -51,8 +51,10 @@ func definitions() []Step {
 		// address that does not yet accept mail.
 		stepRoleMailboxes(),
 		stepMailDNS(),
+		stepMailFrom(),
 		stepMailApply(),
 		stepDMARCPublished(),
+		stepMailFromVisible(),
 		stepSeal(),
 	}
 }

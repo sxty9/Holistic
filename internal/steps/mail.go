@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -230,7 +231,7 @@ func stepMailApply() Step {
 		// dns-apply as well: both run the same warpgate against the same zone,
 		// and two of them planning at once would each compute a plan against a
 		// zone the other is halfway through changing.
-		After: []string{"role-mailboxes", "mail-dns", "dns-apply"},
+		After: []string{"role-mailboxes", "mail-dns", "mailfrom", "dns-apply"},
 		desired: fixed("run warpgate again, which publishes the SPF record at the apex and the DMARC record at " +
 			"_dmarc — and refuses, per record, where something is already standing there that it did not create"),
 		run: func(e *Engine) result {
@@ -341,4 +342,230 @@ func (e *Engine) dmarcPolicy() string {
 		return ""
 	}
 	return atString(tree, "mail.dmarcPolicy")
+}
+
+// The envelope domain — Custom MAIL FROM at the relay, and the two records here
+// that make it work.
+//
+// What it buys, precisely: a message relayed through a provider carries that
+// provider's domain in the SMTP envelope, so SPF passes for the provider and
+// DMARC counts the result as unaligned. DKIM still aligns, so mail is
+// authenticated on one leg. The envelope domain gives it a second one, and the
+// second one is what survives a mailing list that rewrites a message and breaks
+// its signature.
+//
+// It is optional, and staying optional is deliberate. It requires a change at
+// the provider that this wizard cannot make and must not pretend to have made:
+// the records below are one half of a pair, and the provider verifies them
+// before it uses the domain. An operator who has not been to the console yet
+// answers nothing, and the step passes saying what is not in place.
+
+// mailFromLabel is the subdomain the envelope uses. It is named for what it is
+// rather than for where it sits, and it is a constant because a name that can
+// differ between the wizard, the provider and the zone is a name that will.
+const mailFromLabel = "mailfrom"
+
+// sesRegionPattern is the shape of a region name, not a list of them. A list
+// goes stale the week a region opens, and the failure of a stale list is a
+// correct answer being refused.
+var sesRegionPattern = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]$`)
+
+// bounceHost is where the relay accepts bounces for the envelope domain. It is
+// derived from the region and never asked for: two answers that have to agree
+// are two answers that will not.
+func bounceHost(region string) string {
+	if region == "" {
+		return ""
+	}
+	return "feedback-smtp." + region + ".amazonses.com"
+}
+
+func stepMailFrom() Step {
+	return Step{
+		ID:    "mailfrom",
+		Title: "The envelope domain",
+		Kind:  Local,
+		After: []string{"mail-dns"},
+		desired: func(e *Engine) string {
+			return fmt.Sprintf("write mail.mailFrom and mail.mailFromMX into %s, so %s.%s gets an MX for bounces "+
+				"and an SPF record that points at the apex. Left empty, nothing is published and outbound mail "+
+				"aligns on DKIM alone.", e.paths.WarpgateConfig, mailFromLabel, domainOr(e, "<domain>"))
+		},
+		need: func(e *Engine) *Need {
+			envelope := mailFromLabel + "." + domainOr(e, "<domain>")
+			return &Need{
+				Kind:        "text",
+				Label:       "Which region does this instance send mail from?",
+				Placeholder: "eu-central-1",
+				Value:       e.given.sesRegion,
+				Help: "In the SES console, on the sending identity, set the custom MAIL FROM domain to " +
+					envelope + " and choose \"Use default MAIL FROM domain\" as the behaviour on failure — " +
+					"\"Reject message\" stops all outbound mail on a single DNS error. Then give the region here " +
+					"and this wizard publishes the two records it needs.\n\n" +
+					"The provider checks for those records for up to 72 hours and then gives up, so publish them " +
+					"soon after setting the name.\n\n" +
+					"Leave this empty to skip it: mail still authenticates with DKIM, which is what receivers " +
+					"weigh most heavily. It is the second, independent proof that is missing.",
+			}
+		},
+		accept: acceptString(func(e *Engine, s string) error {
+			s = strings.ToLower(strings.TrimSpace(s))
+			// Empty is an answer, and it means "not this". A step that refuses
+			// to record a decision not to do something is a step that stays
+			// amber forever with nothing wrong.
+			if s != "" && !sesRegionPattern.MatchString(s) {
+				return fmt.Errorf("%w: %q is not a region name — they look like eu-central-1", ErrBadAnswer, s)
+			}
+			e.given.sesRegion = s
+			e.given.sesRegionSaid = true
+			return nil
+		}),
+		run: func(e *Engine) result {
+			d := e.catalogue().Domain
+			if d == "" {
+				return blocked("waiting on the domain")
+			}
+			region := e.sesRegion()
+			if region == "" && !e.given.sesRegionSaid && !e.ours("mailfrom") {
+				return blocked("waiting to be told which region mail is sent from, or told to skip it")
+			}
+			ed, err := openEdit(e.paths.WarpgateConfig, confMode)
+			if err != nil {
+				return failed(err.Error())
+			}
+			envelope := mailFromLabel + "." + d
+			if region == "" {
+				// Cleared rather than left behind. A mailFrom in the file with
+				// no decision behind it publishes a subdomain on the next run
+				// of a step nobody was thinking about.
+				ed.set("mail.mailFrom", "")
+				ed.set("mail.mailFromMX", "")
+				res := e.applyOne(ed, "mail.mailFrom", "mail.mailFromMX")
+				if res.status != passedStatus {
+					return res
+				}
+				return passed("no envelope domain",
+					"Nothing is published at "+envelope+", and warpgate publishes the envelope records only when "+
+						"both mail.mailFrom and mail.mailFromMX are set.\n\n"+
+						"Outgoing mail is authenticated by DKIM and aligns on that alone. SPF passes for the relay "+
+						"rather than for "+d+", so a receiver weighing SPF alignment sees none.")
+			}
+			ed.set("mail.mailFrom", mailFromLabel)
+			ed.set("mail.mailFromMX", bounceHost(region))
+			return e.applyOne(ed, "mail.mailFrom", "mail.mailFromMX")
+		},
+	}
+}
+
+func stepMailFromVisible() Step {
+	return Step{
+		ID:        "mailfrom-visible",
+		Title:     "The envelope domain reads back from outside",
+		Kind:      Theirs,
+		After:     []string{"mailfrom", "mail-apply"},
+		WaitingOn: "the public DNS, and then the provider's own check",
+		desired: fixed("ask a public resolver for the envelope domain's MX and SPF records. The provider looks for " +
+			"exactly these two before it will use the domain, and it looks from outside, as this does."),
+		run: func(e *Engine) result {
+			d := e.catalogue().Domain
+			if d == "" {
+				return blocked("waiting on the domain")
+			}
+			region := e.sesRegion()
+			if region == "" {
+				// Not a pass dressed up as one: there is genuinely nothing to
+				// observe, and the row says which decision led here rather than
+				// reporting a success.
+				return passed("no envelope domain to look for",
+					"mailfrom recorded that no envelope domain is configured, so nothing was published at "+
+						mailFromLabel+"."+d+" and there is nothing to read back.")
+			}
+			envelope := mailFromLabel + "." + d
+			mx, err := e.dnsAnswers(envelope, "MX")
+			if err != nil {
+				return waitingOnThem(err.Error())
+			}
+			txt, err := e.dnsAnswers(envelope, "TXT")
+			if err != nil {
+				return waitingOnThem(err.Error())
+			}
+			want := bounceHost(region)
+			var missing []string
+			if !containsFold(mx, want) {
+				missing = append(missing, "no MX at "+envelope+" naming "+want)
+			}
+			if !containsFold(txt, "v=spf1 redirect="+d) {
+				missing = append(missing, "no SPF record at "+envelope+" reading v=spf1 redirect="+d)
+			}
+			if len(missing) > 0 {
+				return waitingOnThem(strings.Join(missing, "; ") +
+					". Cloudflare caches a miss for 30 minutes, so records published just now take up to that " +
+					"long to appear here.")
+			}
+			return passed("both records are visible from outside", fmt.Sprintf(
+				"a public resolver that is not Cloudflare answered for %s:\n  MX  %s\n  TXT %s\n\n"+
+					"The provider looks for exactly these before it will use %s as the envelope domain, and it "+
+					"gives up after 72 hours. Once it accepts them, a delivered message carries %s in its "+
+					"Return-Path and SPF counts for %s rather than for the relay.",
+				envelope, strings.Join(mx, ", "), strings.Join(txt, ", "), envelope, envelope, d))
+		},
+	}
+}
+
+// dnsAnswers asks a public resolver, and it is the one place the wizard reads
+// DNS. The resolver is deliberately not the one the records were written to:
+// reading them back from Cloudflare would establish that Cloudflare stored what
+// it was sent, which nobody doubts.
+func (e *Engine) dnsAnswers(name, typ string) ([]string, error) {
+	u := "https://dns.google/resolve?type=" + url.QueryEscape(typ) + "&name=" + url.QueryEscape(name)
+	res, err := e.fetch(context.Background(), u)
+	if err != nil {
+		return nil, fmt.Errorf("a public resolver could not be asked about %s %s: %v", typ, name, err)
+	}
+	if res.Status != 200 {
+		return nil, fmt.Errorf("the public resolver answered %d for %s %s", res.Status, typ, name)
+	}
+	var body struct {
+		Answer []struct {
+			Data string `json:"data"`
+		} `json:"Answer"`
+	}
+	if err := json.Unmarshal([]byte(res.Body), &body); err != nil {
+		return nil, fmt.Errorf("the public resolver's answer about %s %s could not be read: %v", typ, name, err)
+	}
+	var out []string
+	for _, a := range body.Answer {
+		out = append(out, strings.Trim(strings.TrimSpace(a.Data), `"`))
+	}
+	return out, nil
+}
+
+func containsFold(in []string, want string) bool {
+	for _, s := range in {
+		if strings.Contains(strings.ToLower(s), strings.ToLower(want)) {
+			return true
+		}
+	}
+	return false
+}
+
+// sesRegion is what was answered in this process, or what the file already
+// says. The file is the state; `given` is only what has been said since.
+func (e *Engine) sesRegion() string {
+	if e.given.sesRegionSaid {
+		return e.given.sesRegion
+	}
+	tree, _, err := readTree(e.paths.WarpgateConfig)
+	if err != nil {
+		return ""
+	}
+	host := atString(tree, "mail.mailFromMX")
+	// The region is carried by the host name and derived back out of it, rather
+	// than stored twice. Two fields that have to agree are two fields that will
+	// not, and the one that goes stale is the one nothing reads.
+	const prefix, suffix = "feedback-smtp.", ".amazonses.com"
+	if !strings.HasPrefix(host, prefix) || !strings.HasSuffix(host, suffix) {
+		return ""
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(host, prefix), suffix)
 }

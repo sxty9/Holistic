@@ -78,8 +78,10 @@ run unattended.
 | `corex-restart-2` | `local` | restart again; check the apex while logged out |
 | `role-mailboxes` | `local` | create `dmarc@`, `postmaster@` and `abuse@` through `corexctl`. They receive and never send. |
 | `mail-dns` | `local` | write Warpgate's `mail` block: SPF mechanism, DMARC policy, report address |
-| `mail-apply` | `foreign` | run warpgate again; publish the apex SPF record and `_dmarc` |
+| `mailfrom` | `local` | the envelope domain for SPF alignment, or an answered decision not to have one |
+| `mail-apply` | `foreign` | run warpgate again; publish the apex SPF record, `_dmarc`, and the envelope domain's two records |
 | `dmarc-published` | `theirs` | read `_dmarc` back from a public resolver that is not Cloudflare |
+| `mailfrom-visible` | `theirs` | read the envelope domain's MX and SPF back the same way, because that is how the provider checks them |
 | `seal` | `local` | record the instance as claimed, destroy the setup code, stop the LAN listener — one act |
 
 **The mail order is deliberate and reads backwards.** `role-mailboxes` comes

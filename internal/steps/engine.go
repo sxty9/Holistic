@@ -79,8 +79,15 @@ type given struct {
 	// from the file on every use because it is answered before it is
 	// written, and the step that writes it needs to know what was said.
 	dmarcPolicy string
-	planOK      bool
-	sealOK      bool
+	// sesRegion is where outbound mail is relayed from, and sesRegionSaid is
+	// whether anybody has said. They are two fields because the empty string
+	// is a real answer here — "no envelope domain" — and a step that cannot
+	// tell it from "nobody has been asked yet" either blocks forever or
+	// records a decision nobody made.
+	sesRegion     string
+	sesRegionSaid bool
+	planOK        bool
+	sealOK        bool
 }
 
 // New builds the engine and reads the machine before it is asked anything.

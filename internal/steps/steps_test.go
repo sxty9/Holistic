@@ -348,9 +348,14 @@ func (k *kit) drive() {
 	k.mustPass("role-mailboxes")
 	k.answer("mail-dns", "quarantine")
 	k.mustPass("mail-dns")
-	// Both talk to somebody else: mail-apply runs warpgate against a real
-	// zone, and dmarc-published asks a public resolver.
-	k.standIn("mail-apply", "dmarc-published")
+	// The envelope domain is optional and this path says so out loud: empty is
+	// a real answer, and the wizard has to be able to finish without it. The
+	// tests that configure one say so themselves.
+	k.answer("mailfrom", "")
+	k.mustPass("mailfrom")
+	// These talk to somebody else: mail-apply runs warpgate against a real
+	// zone, and the two read-backs ask a public resolver.
+	k.standIn("mail-apply", "dmarc-published", "mailfrom-visible")
 }
 
 // mailboxesAnswer makes corexctl behave the way it does on a machine where the

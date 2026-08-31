@@ -1,6 +1,7 @@
 package steps
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -213,5 +214,189 @@ func (k *kit) setInWarpgate(path string, v any) {
 	}
 	if err := os.WriteFile(k.p.WarpgateConfig, b, 0o640); err != nil {
 		k.t.Fatal(err)
+	}
+}
+
+// Empty is an answer, and it has to be distinguishable from nobody having been
+// asked. A step that cannot tell the two apart either blocks forever with
+// nothing wrong or records a decision nobody made.
+func TestNoEnvelopeDomainIsADecisionAndNotAGap(t *testing.T) {
+	k := newKit(t)
+	k.drive() // answers "" for mailfrom
+
+	row := k.row("mailfrom")
+	if row.Status != ledger.Passed {
+		t.Fatalf("mailfrom: %s — %s", row.Status, row.Detail)
+	}
+	// The consequence, in the row, rather than only in a document: what is lost
+	// by not having one is SPF alignment, and the operator is the one who has
+	// to know that.
+	if !strings.Contains(row.Proof, "DKIM") || !strings.Contains(row.Proof, "SPF") {
+		t.Errorf("the row does not say what having no envelope domain costs: %q", row.Proof)
+	}
+	tree, _, err := readTree(k.p.WarpgateConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atString(tree, "mail.mailFrom"); got != "" {
+		t.Errorf("it configured an envelope domain anyway: %q", got)
+	}
+
+	// Changing one's mind, which is the case that matters: an envelope domain
+	// configured and then withdrawn has to leave the file, not merely stop
+	// being mentioned. Left behind, warpgate keeps publishing the subdomain on
+	// the next run of a step nobody was thinking about.
+	k.answer("mailfrom", "eu-central-1")
+	k.mustPass("mailfrom")
+	k.answer("mailfrom", "")
+	k.mustPass("mailfrom")
+	tree, _, err = readTree(k.p.WarpgateConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"mail.mailFrom", "mail.mailFromMX"} {
+		if got := atString(tree, key); got != "" {
+			t.Errorf("%s still reads %q after the envelope domain was withdrawn", key, got)
+		}
+	}
+
+	// And nothing is looked for that was never published.
+	if row := k.run("mailfrom-visible"); row.Status != ledger.Passed {
+		t.Errorf("mailfrom-visible: %s — %s", row.Status, row.Detail)
+	}
+	if calls := strings.Join(k.m.calls, "\n"); strings.Contains(calls, "dns.google") {
+		t.Error("it asked a resolver about a name it never published")
+	}
+}
+
+// A region is turned into exactly one bounce host, in one place. Two fields
+// that have to agree are two fields that will not.
+func TestTheEnvelopeDomainIsConfiguredFromTheRegionAlone(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+	k.answer("mailfrom", "eu-central-1")
+	k.mustPass("mailfrom")
+
+	tree, _, err := readTree(k.p.WarpgateConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atString(tree, "mail.mailFrom"); got != "mailfrom" {
+		t.Errorf("mail.mailFrom is %q", got)
+	}
+	want := "feedback-smtp.eu-central-1.amazonses.com"
+	if got := atString(tree, "mail.mailFromMX"); got != want {
+		t.Errorf("mail.mailFromMX is %q, wanted %q", got, want)
+	}
+	// Read back out of the file by a fresh engine, which is what a later
+	// process does. A region that only exists in this process's memory is a
+	// region the next run loses.
+	fresh := NewWith(k.led, k.p, k.m, func(ctx context.Context, url string) (Response, error) {
+		return k.resp, k.ferr
+	}, k.cf)
+	if got := fresh.sesRegion(); got != "eu-central-1" {
+		t.Errorf("a new process reads the region as %q", got)
+	}
+}
+
+// Nonsense is refused before it is written, and the refusal says what a region
+// looks like rather than only that this is not one.
+func TestARegionThatIsNotOneIsRefused(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+	raw, err := json.Marshal("Frankfurt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = k.e.Answer("mailfrom", raw)
+	if err == nil {
+		t.Fatal("it accepted \"Frankfurt\" as a region")
+	}
+	if !strings.Contains(err.Error(), "eu-central-1") {
+		t.Errorf("the refusal does not show what one looks like: %v", err)
+	}
+}
+
+// Both records or the provider will not use the domain, and it stops without
+// saying so. So the step waits on both and names the one that is missing.
+func TestTheEnvelopeDomainNeedsBothRecordsToBeVisible(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+	k.answer("mailfrom", "eu-central-1")
+	k.mustPass("mailfrom")
+	k.standIn("mail-apply")
+
+	answers := map[string][]string{}
+	k.respFor = func(u string) (Response, error) {
+		typ := "MX"
+		if strings.Contains(u, "type=TXT") {
+			typ = "TXT"
+		}
+		var data []map[string]any
+		for _, a := range answers[typ] {
+			data = append(data, map[string]any{"data": a})
+		}
+		b, err := json.Marshal(map[string]any{"Status": 0, "Answer": data})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return Response{Status: 200, Body: string(b)}, nil
+	}
+
+	// Neither.
+	if row := k.run("mailfrom-visible"); row.Status != ledger.WaitingOnThem {
+		t.Errorf("with neither record it read as %s: %s", row.Status, row.Detail)
+	}
+
+	// The MX alone. SPF is the half that does the aligning, so this is the one
+	// that would otherwise look finished.
+	answers["MX"] = []string{"10 feedback-smtp.eu-central-1.amazonses.com."}
+	row := k.run("mailfrom-visible")
+	if row.Status != ledger.WaitingOnThem {
+		t.Errorf("with only the MX it read as %s: %s", row.Status, row.Detail)
+	}
+	if !strings.Contains(row.Detail, "v=spf1 redirect="+testDomain) {
+		t.Errorf("the wait does not name the missing record: %q", row.Detail)
+	}
+
+	// The SPF alone.
+	answers["MX"] = nil
+	answers["TXT"] = []string{`"v=spf1 redirect=` + testDomain + `"`}
+	row = k.run("mailfrom-visible")
+	if row.Status != ledger.WaitingOnThem {
+		t.Errorf("with only the SPF record it read as %s: %s", row.Status, row.Detail)
+	}
+	if !strings.Contains(row.Detail, "feedback-smtp.eu-central-1.amazonses.com") {
+		t.Errorf("the wait does not name the missing bounce host: %q", row.Detail)
+	}
+
+	// Both.
+	answers["MX"] = []string{"10 feedback-smtp.eu-central-1.amazonses.com."}
+	row = k.run("mailfrom-visible")
+	if row.Status != ledger.Passed {
+		t.Fatalf("mailfrom-visible: %s — %s", row.Status, row.Detail)
+	}
+	if !strings.Contains(row.Proof, "Return-Path") {
+		t.Errorf("the proof does not say what the records buy: %q", row.Proof)
+	}
+}
+
+// An MX belonging to somebody else at that name is not a record that satisfies
+// this. The check is for the bounce host, not for the presence of an MX.
+func TestSomebodyElsesMXDoesNotCountAsTheEnvelopeDomain(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+	k.answer("mailfrom", "eu-central-1")
+	k.mustPass("mailfrom")
+	k.standIn("mail-apply")
+	k.respFor = func(u string) (Response, error) {
+		data := `{"data":"10 mx.somewhere.invalid."}`
+		if strings.Contains(u, "type=TXT") {
+			data = `{"data":"\"v=spf1 redirect=` + testDomain + `\""}`
+		}
+		return Response{Status: 200, Body: `{"Status":0,"Answer":[` + data + `]}`}, nil
+	}
+	if row := k.run("mailfrom-visible"); row.Status == ledger.Passed {
+		t.Fatal("it accepted somebody else's mail host as the bounce host")
 	}
 }
