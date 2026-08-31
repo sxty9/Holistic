@@ -159,7 +159,11 @@ func RestartUnits(units []string) ([]string, error) {
 	return restarted, nil
 }
 
-func unitIsActive(unit string) bool {
+func unitIsActive(unit string) bool { return isActive(unit) }
+
+// isActive is a variable for the same reason unitExec is: the checks that read
+// the service manager have to be exercisable without one.
+var isActive = func(unit string) bool {
 	// `is-active` exits non-zero for anything that is not active, which is the
 	// question being asked, so the exit code is the answer.
 	return exec.Command("systemctl", "is-active", "--quiet", unit).Run() == nil
@@ -172,4 +176,93 @@ func unitIsActive(unit string) bool {
 func Claimed(confDir string) bool {
 	_, err := os.Stat(filepath.Join(confDir, "claimed"))
 	return err == nil
+}
+
+// Whether the units that get restarted actually run the binaries that were just
+// replaced.
+//
+// This exists because they did not, and nothing said so. On 2026-09-01 an
+// instance had been upgraded five times: /opt/holistic/bin held v0.2.5 and
+// corex-api.service ran /opt/corex/bin/corex-api, dated 16 August. Every
+// upgrade replaced files nothing executed, restarted the old processes, printed
+// the list of units it had restarted, and ended with "Now running v0.2.5." The
+// machine was serving August code and every check agreed it was current.
+//
+// It is the failure this whole project began with, in the tool built to prevent
+// it: each step succeeded and the outcome did not happen.
+
+// unitExec reads a unit's ExecStart path. It is a variable so a test can drive
+// every branch of the check without a service manager.
+var unitExec = func(unit string) (string, error) {
+	out, err := exec.Command("systemctl", "show", unit, "-p", "ExecStart", "--value").Output()
+	if err != nil {
+		return "", err
+	}
+	// The value is a structured record, not a command line:
+	//   { path=/opt/corex/bin/corex-api ; argv[]=... ; ignore_errors=no ; ... }
+	// The path field is the binary that will actually be executed, and it is
+	// the only field this check is about.
+	for _, f := range strings.Fields(string(out)) {
+		if p, ok := strings.CutPrefix(f, "path="); ok {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("%s has no ExecStart path", unit)
+}
+
+// Stray is a unit that runs a binary from somewhere this release does not
+// manage.
+type Stray struct {
+	Unit string
+	// Runs is the binary the service manager will actually execute.
+	Runs string
+}
+
+// StrayUnits reports the active units among these whose ExecStart points
+// outside binDir.
+//
+// Only active ones: a unit that is not running was not restarted either, so it
+// is not making a false claim about anything. And only ExecStart — not the
+// unit file's own path, not its name — because the question is what runs, and a
+// unit can be edited, dropped-in over, or aliased.
+func StrayUnits(units []string, binDir string) ([]Stray, error) {
+	want, err := filepath.Abs(binDir)
+	if err != nil {
+		return nil, err
+	}
+	var out []Stray
+	for _, u := range units {
+		if !unitIsActive(u) {
+			continue
+		}
+		path, err := unitExec(u)
+		if err != nil {
+			// Unreadable is not the same as fine. A check that can return "all
+			// clear" because it could not read is not a check.
+			out = append(out, Stray{Unit: u, Runs: "could not be read: " + err.Error()})
+			continue
+		}
+		if filepath.Dir(path) != want {
+			out = append(out, Stray{Unit: u, Runs: path})
+		}
+	}
+	return out, nil
+}
+
+// StrayMessage is what the operator is told. It names each unit, what it runs
+// instead, and what to do — and it says plainly that the upgrade did not reach
+// them, because the one thing this must never do is read like a warning beside
+// a success.
+func StrayMessage(strays []Stray, binDir, version string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "the binaries under %s are now %s, and these services do NOT run them:\n\n", binDir, version)
+	for _, s := range strays {
+		fmt.Fprintf(&b, "    %-28s runs %s\n", s.Unit, s.Runs)
+	}
+	fmt.Fprintf(&b, "\nSo they were restarted and came back on the software they were already running.\n"+
+		"Nothing about this instance changed.\n\n"+
+		"Point each unit's ExecStart at %s and reload systemd, then upgrade again:\n\n"+
+		"    sudo systemctl edit --full <unit>\n"+
+		"    sudo systemctl daemon-reload\n", binDir)
+	return b.String()
 }

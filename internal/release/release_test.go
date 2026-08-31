@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -283,4 +284,96 @@ func TestAReleaseWithoutAVersionFileFallsBackToTheRefAsked(t *testing.T) {
 	if rel.Version != "latest" {
 		t.Errorf("Version = %q, want the requested ref back", rel.Version)
 	}
+}
+
+// The check that would have caught five upgrades that changed nothing.
+func TestStrayUnitsNamesWhatActuallyRuns(t *testing.T) {
+	active := map[string]bool{"a.service": true, "b.service": true, "off.service": false}
+	exec := map[string]string{
+		"a.service":   "/opt/holistic/bin/a",
+		"b.service":   "/opt/corex/bin/b",
+		"off.service": "/opt/corex/bin/off",
+	}
+	restore := stubUnits(active, exec)
+	defer restore()
+
+	got, err := StrayUnits([]string{"a.service", "b.service", "off.service"}, "/opt/holistic/bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("wanted one stray, got %d: %+v", len(got), got)
+	}
+	if got[0].Unit != "b.service" || got[0].Runs != "/opt/corex/bin/b" {
+		t.Errorf("the stray is reported as %+v", got[0])
+	}
+	// An inactive unit was not restarted either, so it is making no false
+	// claim and must not be reported as one.
+	for _, s := range got {
+		if s.Unit == "off.service" {
+			t.Error("a unit that is not running was reported as a stray")
+		}
+	}
+}
+
+// A unit whose ExecStart cannot be read is reported, not passed over. A check
+// that can answer "all clear" because it could not read is not a check.
+func TestAnUnreadableUnitIsNotAPass(t *testing.T) {
+	restore := stubUnits(map[string]bool{"a.service": true}, map[string]string{})
+	defer restore()
+	got, err := StrayUnits([]string{"a.service"}, "/opt/holistic/bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("an unreadable unit produced %d strays", len(got))
+	}
+	if !strings.Contains(got[0].Runs, "could not be read") {
+		t.Errorf("it does not say the unit could not be read: %q", got[0].Runs)
+	}
+}
+
+// A trailing separator or a relative form of the same directory is the same
+// directory, and reporting it as a stray would make the check cry wolf until
+// somebody switches it off.
+func TestTheSameDirectoryWrittenDifferentlyIsNotAStray(t *testing.T) {
+	restore := stubUnits(
+		map[string]bool{"a.service": true},
+		map[string]string{"a.service": "/opt/holistic/bin/a"})
+	defer restore()
+	for _, dir := range []string{"/opt/holistic/bin", "/opt/holistic/bin/", "/opt/holistic/./bin"} {
+		got, err := StrayUnits([]string{"a.service"}, dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Errorf("%q was read as a different directory", dir)
+		}
+	}
+}
+
+// The message has to read as a failure, not as a note beside a success.
+func TestTheStrayMessageSaysNothingChanged(t *testing.T) {
+	msg := StrayMessage([]Stray{{Unit: "corex-api.service", Runs: "/opt/corex/bin/corex-api"}},
+		"/opt/holistic/bin", "v0.2.5")
+	for _, want := range []string{"corex-api.service", "/opt/corex/bin/corex-api", "Nothing about this instance changed"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the message does not contain %q:\n%s", want, msg)
+		}
+	}
+}
+
+// stubUnits replaces the two calls to the service manager, so every branch of
+// the check runs without one.
+func stubUnits(active map[string]bool, execs map[string]string) func() {
+	oldExec, oldActive := unitExec, isActive
+	unitExec = func(u string) (string, error) {
+		p, ok := execs[u]
+		if !ok {
+			return "", errors.New("no such unit")
+		}
+		return p, nil
+	}
+	isActive = func(u string) bool { return active[u] }
+	return func() { unitExec, isActive = oldExec, oldActive }
 }

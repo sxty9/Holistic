@@ -42,14 +42,26 @@ PLATFORMS=(linux/amd64 linux/arm64)
 # corex-hostek and homebridge-adapter are optional adapters, not part of what a
 # fresh instance needs, and shipping a binary nothing installs is how a release
 # grows things nobody can explain later.
+# repo:package:binary[:version symbol]
+#
+# The fourth field is where that binary keeps the version it reports at run
+# time, when that is not main.version. It is here rather than assumed because
+# `go build -X` on a symbol that does not exist is silently ignored, and the
+# result is a signed release whose /health says "dev" — which is exactly what
+# corex-api, corex-routedge and roomsense did until 2026-09-01. Nothing failed;
+# the System Monitor and every health check simply could not tell one release
+# from another.
+#
+# assert_symbol below refuses to build when a named symbol is not in the
+# repository, so the silent case cannot come back.
 COMPONENTS=(
 	"Holistic:./cmd/holistic-setup:holistic-setup"
 	"Holistic:./cmd/holistic:holistic"
-	"coreX:./cmd/corex-api:corex-api"
-	"coreX:./cmd/corex-routedge:corex-routedge"
+	"coreX:./cmd/corex-api:corex-api:github.com/sxty9/coreX/internal/platform/health.Version"
+	"coreX:./cmd/corex-routedge:corex-routedge:github.com/sxty9/coreX/internal/platform/health.Version"
 	"coreX:./cmd/corexctl:corexctl"
 	"Solisuite:./server:solisuite"
-	"RoomSense:./cmd/roomsense:roomsense"
+	"RoomSense:./cmd/roomsense:roomsense:github.com/sxty9/RoomSense/internal/platform/health.Version"
 	"Warpgate:./cmd/warpgate:warpgate"
 )
 
@@ -193,10 +205,46 @@ sign_manifest() {
 
 # --- build ------------------------------------------------------------------
 
+# assert_symbol refuses to build when a version symbol named in COMPONENTS is
+# not actually declared in the repository.
+#
+# `go build -X pkg.Name=value` on a symbol that does not exist prints nothing
+# and changes nothing, so the only way to notice is to run the binary and read
+# the version it reports — which nobody does, because it is a signed release
+# and it starts.
+assert_symbol() {
+	# $1 repository directory, $2 symbol, $3 package being built.
+	local dir="$1" sym="$2" var pkgpath file
+	var="${sym##*.}"
+	pkgpath="${sym%.*}"
+	file="$dir/${pkgpath#*/*/*/}"
+	[ -d "$file" ] || die "$sym names $file, which is not a directory in $dir.
+       The fourth field of a COMPONENTS entry is an import path plus a variable
+       name, and this one does not resolve."
+	grep -rqE "^var[[:space:]]+$var[[:space:]]*=" "$file" ||
+		die "$sym is named in COMPONENTS and is not declared in $file.
+       go build would accept the -X flag, ignore it, and produce a release that
+       reports its version as whatever the source says — usually \"dev\"."
+
+	# Declared is not the same as linked. A package the binary does not import
+	# is not in it, and -X against it is ignored just as quietly as -X against a
+	# name that does not exist.
+	( cd "$dir" && go list -deps "$3" 2>/dev/null | grep -qx "$pkgpath" ) ||
+		die "$3 in $repo does not import $pkgpath, so stamping $sym into it would
+       do nothing. Either the binary does not report a version, in which case
+       drop the fourth field, or it reports one from somewhere else."
+}
+
 build_one() {
-	local repo="$1" pkg="$2" out="$3" goos="$4" goarch="$5" dest="$6" version="$7"
+	local repo="$1" pkg="$2" out="$3" goos="$4" goarch="$5" dest="$6" version="$7" versionSym="${8:-}"
 	local dir="$SRC_ROOT/$repo"
 	[ -d "$dir" ] || die "$dir is not there. Set SRC_ROOT to the directory holding the repositories."
+
+	local extra=""
+	if [ -n "$versionSym" ]; then
+		assert_symbol "$dir" "$versionSym" "$pkg"
+		extra=" -X $versionSym=$version"
+	fi
 
 	# CGO_ENABLED=0 is what makes one binary run on every Linux — glibc, musl,
 	# any version — with no toolchain on the target. It is possible here only
@@ -207,7 +255,7 @@ build_one() {
 		cd "$dir"
 		CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
 			go build -trimpath \
-			-ldflags "-s -w -X main.version=$version -X main.pubkeyB64=$(installer_pubkey | base64 -w0)" \
+			-ldflags "-s -w -X main.version=$version -X main.pubkeyB64=$(installer_pubkey | base64 -w0)$extra" \
 			-o "$dest/$out" "$pkg"
 	)
 }
@@ -249,8 +297,8 @@ build() {
 		note "$goos/$goarch"
 		local c repo pkg out
 		for c in "${COMPONENTS[@]}"; do
-			IFS=: read -r repo pkg out <<<"$c"
-			build_one "$repo" "$pkg" "$out" "$goos" "$goarch" "$stage/bin" "$version"
+			IFS=: read -r repo pkg out versionSym <<<"$c"
+			build_one "$repo" "$pkg" "$out" "$goos" "$goarch" "$stage/bin" "$version" "$versionSym"
 			verify_static "$stage/bin/$out"
 			printf '     %s\n' "$out"
 		done

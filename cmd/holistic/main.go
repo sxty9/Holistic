@@ -283,6 +283,10 @@ func cmdUpgrade(args []string) error {
 			fmt.Printf("   restart %s (only if it is running)\n", u)
 		}
 		fmt.Println("\n   The setup state is not touched: " + *conf + "/claimed stays as it is.")
+		if strays, serr := release.StrayUnits(managedUnits, filepath.Join(*prefix, "bin")); serr == nil && len(strays) > 0 {
+			fmt.Println("\n== And it would not take effect")
+			fmt.Print("   " + strings.ReplaceAll(release.StrayMessage(strays, filepath.Join(*prefix, "bin"), rel.Version), "\n", "\n   ") + "\n")
+		}
 		return nil
 	}
 
@@ -293,6 +297,15 @@ func cmdUpgrade(args []string) error {
 	}
 	for _, n := range replaced {
 		fmt.Printf("   %s\n", filepath.Join(*prefix, "bin", n))
+	}
+
+	// Before the restart, not after. A unit that runs a binary from somewhere
+	// else will come back perfectly, so there is nothing in the restart's own
+	// outcome that could ever reveal it.
+	binDir := filepath.Join(*prefix, "bin")
+	strays, serr := release.StrayUnits(managedUnits, binDir)
+	if serr != nil {
+		return serr
 	}
 
 	fmt.Println("\n== Restarting what is running")
@@ -315,6 +328,20 @@ func cmdUpgrade(args []string) error {
 	}
 	if len(restarted) == 0 {
 		fmt.Println("   nothing was running, so nothing was restarted")
+	}
+
+	if len(strays) > 0 {
+		// Written first: the binaries really were replaced, and a version
+		// record that says otherwise would make the next upgrade think there
+		// is nothing to do. Then the error, because this upgrade did not
+		// reach the running services and saying "Now running" would be false.
+		if err := release.WriteInstalled(*state, &release.Installed{
+			Version: rel.Version, Platform: rel.Platform, Archive: rel.Archive,
+			SHA256: rel.SHA256, InstalledAt: time.Now().UTC(), Binaries: replaced,
+		}); err != nil {
+			return err
+		}
+		return fmt.Errorf("%s", release.StrayMessage(strays, binDir, rel.Version))
 	}
 
 	if err := release.WriteInstalled(*state, &release.Installed{
