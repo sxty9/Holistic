@@ -52,6 +52,20 @@ type App struct {
 	// shows these as checked and refuses to uncheck them, rather than letting
 	// somebody build an instance with no way to sign in.
 	Required bool `json:"required,omitempty"`
+	// Aliases are further hostnames that reach the same app.
+	//
+	// One app, several names: the launcher answers on the apex, on
+	// launcher.<domain>, and on hub.<domain>, because that is what the operator
+	// asked for and because a name people already type should not become a
+	// dead end. Each alias gets its own DNS record, its own ingress rule and
+	// its own entry in Solisuite's host map — Solisuite resolves a Host header
+	// through that map, so two entries with the same app id and different
+	// hosts are exactly what it wants.
+	//
+	// NOT a second entry in coreX's appOrigins. An app has one origin, which
+	// is where the launcher sends people; several names that reach it do not
+	// make several apps.
+	Aliases []string `json:"aliases,omitempty"`
 	// Note is shown next to the checkbox.
 	Note string `json:"note,omitempty"`
 }
@@ -61,8 +75,15 @@ type App struct {
 // for everybody else — the wizard hands this straight to a UI that edits it.
 func Default() []App {
 	return []App{
+		// hub, because the operator asked for three names: the apex, which
+		// Warpgate publishes through rootServes, launcher.<domain>, and
+		// hub.<domain>. A name people already type should not be a dead end,
+		// and without an entry in Solisuite's host map it would only work by
+		// falling through to DefaultApp — which answers for every unknown host
+		// and would make it work by accident rather than by configuration.
 		{ID: "launcher", Label: "Launcher", Upstream: solisuite, Enabled: true, Required: true,
-			Note: "The way in. Every other app is reached from here."},
+			Aliases: []string{"hub"},
+			Note:    "The way in. Every other app is reached from here. Also answers on hub."},
 		{ID: "mail", Label: "Mail", Upstream: solisuite, Enabled: true, Protocols: []string{"sse"}},
 		{ID: "calendar", Label: "Calendar", Upstream: solisuite, Enabled: true, Protocols: []string{"sse"}},
 		{ID: "contacts", Label: "Contacts", Upstream: solisuite, Enabled: true},
@@ -144,16 +165,36 @@ func (c Catalogue) Validate() error {
 	if strings.ContainsAny(c.Domain, "/: ") {
 		return fmt.Errorf("%q is not a bare domain", c.Domain)
 	}
-	seen := map[string]bool{}
-	launcher := false
+	// Every name this catalogue would publish, gathered before anything is
+	// judged. Checking as it goes makes the answer depend on the order of the
+	// list: an alias colliding with an app FURTHER DOWN passes the alias check
+	// and is caught later, or not at all, by the app-id check — which reports
+	// the wrong one of the two as the problem. Measured: `launcher` aliased to
+	// `mail` was reported as "app \"mail\" appears twice".
+	owner := map[string]string{}
 	for _, a := range c.Apps {
 		if a.ID == "" {
 			return errors.New("every app needs an id — it becomes the subdomain")
 		}
-		if seen[a.ID] {
-			return fmt.Errorf("app %q appears twice", a.ID)
+		names := append([]string{a.ID}, a.Aliases...)
+		for i, n := range names {
+			if n == "" {
+				return fmt.Errorf("app %q has an empty alias", a.ID)
+			}
+			if held, taken := owner[n]; taken {
+				// Whichever entry Solisuite's host map took last would win, and
+				// nothing would say which.
+				if held == a.ID && i > 0 {
+					return fmt.Errorf("app %q lists %q as an alias of itself", a.ID, n)
+				}
+				return fmt.Errorf("%q is claimed by both %q and %q", n, held, a.ID)
+			}
+			owner[n] = a.ID
 		}
-		seen[a.ID] = true
+	}
+
+	launcher := false
+	for _, a := range c.Apps {
 		if a.Enabled && a.Upstream == "" {
 			return fmt.Errorf("app %q is enabled with no upstream", a.ID)
 		}
@@ -206,8 +247,16 @@ type WarpgateApp struct {
 func (c Catalogue) Warpgate() []WarpgateApp {
 	var out []WarpgateApp
 	for _, a := range c.Enabled() {
-		w := WarpgateApp{Name: a.ID, Upstream: a.Upstream, Protocols: a.Protocols, Comment: a.Note}
-		out = append(out, w)
+		out = append(out, WarpgateApp{Name: a.ID, Upstream: a.Upstream, Protocols: a.Protocols, Comment: a.Note})
+		// An alias is another name at the edge and nothing more: same
+		// upstream, same protocols. Warpgate keys a record by its name, so
+		// each one is its own entry.
+		for _, alias := range a.Aliases {
+			out = append(out, WarpgateApp{
+				Name: alias, Upstream: a.Upstream, Protocols: a.Protocols,
+				Comment: "another name for " + a.ID,
+			})
+		}
 	}
 	return out
 }
@@ -235,6 +284,21 @@ func (c Catalogue) Solisuite() []SolisuiteApp {
 			ID: a.ID, Label: a.Label, Icon: a.Icon,
 			Host: c.Hostname(a.ID), Origin: c.Origin(a.ID),
 		})
+		// One entry per alias, same id. appFor resolves a Host header through
+		// this map, so this is how a second name reaches the same app instead
+		// of falling through to DefaultApp — which answers for every unknown
+		// host and would make the alias work by accident rather than by
+		// configuration.
+		//
+		// Origin stays the canonical one: it is where the launcher sends
+		// people, and it should be the same place whichever name they arrived
+		// under.
+		for _, alias := range a.Aliases {
+			out = append(out, SolisuiteApp{
+				ID: a.ID, Label: a.Label, Icon: a.Icon,
+				Host: c.Hostname(alias), Origin: c.Origin(a.ID),
+			})
+		}
 	}
 	return out
 }
@@ -281,6 +345,9 @@ func (c Catalogue) WebHostnames() []string {
 			continue
 		}
 		out = append(out, c.Hostname(a.ID))
+		for _, alias := range a.Aliases {
+			out = append(out, c.Hostname(alias))
+		}
 	}
 	return out
 }
@@ -291,6 +358,9 @@ func (c Catalogue) Hostnames() []string {
 	var out []string
 	for _, a := range c.Enabled() {
 		out = append(out, c.Hostname(a.ID))
+		for _, alias := range a.Aliases {
+			out = append(out, c.Hostname(alias))
+		}
 	}
 	return out
 }

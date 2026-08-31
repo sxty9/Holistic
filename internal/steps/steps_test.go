@@ -294,6 +294,9 @@ func (k *kit) writeIngress() {
 	b.WriteString("# Written by warpgate. Do not edit.\ntunnel: test-tunnel\ningress:\n")
 	for _, a := range k.e.catalogue().Enabled() {
 		fmt.Fprintf(&b, "  - hostname: %s\n    service: %s\n", k.e.catalogue().Hostname(a.ID), a.Upstream)
+		for _, alias := range a.Aliases {
+			fmt.Fprintf(&b, "  - hostname: %s\n    service: %s\n", k.e.catalogue().Hostname(alias), a.Upstream)
+		}
 	}
 	b.WriteString("  - service: http_status:404\n")
 	if err := os.MkdirAll(filepath.Dir(k.p.WarpgateIngress), 0o755); err != nil {

@@ -30,14 +30,19 @@ func TestOneAnswerReachesAllThreeConsistently(t *testing.T) {
 	for _, a := range c.Warpgate() {
 		inWarpgate[a.Name] = true
 	}
+	// An app has one canonical hostname and may have further names that reach
+	// it. What must hold for every entry: the host is under the configured
+	// domain, and the ORIGIN is the canonical one — it is where the launcher
+	// sends people, and that should be the same place whichever name they
+	// arrived under.
 	inSolisuite := map[string]bool{}
 	for _, a := range c.Solisuite() {
 		inSolisuite[a.ID] = true
-		if a.Host != a.ID+".example.org" {
-			t.Errorf("%s: host is %q", a.ID, a.Host)
+		if !strings.HasSuffix(a.Host, ".example.org") {
+			t.Errorf("%s: host %q is not under the configured domain", a.ID, a.Host)
 		}
-		if a.Origin != "https://"+a.Host {
-			t.Errorf("%s: origin %q does not match host %q", a.ID, a.Origin, a.Host)
+		if a.Origin != "https://"+a.ID+".example.org" {
+			t.Errorf("%s: origin is %q, want the app's canonical one", a.ID, a.Origin)
 		}
 	}
 
@@ -159,8 +164,12 @@ func TestDefaultsCannotBeMutatedForEveryoneElse(t *testing.T) {
 func TestHostnamesCoverEveryEnabledApp(t *testing.T) {
 	c := testCat()
 	names := c.Hostnames()
-	if len(names) != len(c.Enabled()) {
-		t.Fatalf("%d hostnames for %d enabled apps", len(names), len(c.Enabled()))
+	want := 0
+	for _, a := range c.Enabled() {
+		want += 1 + len(a.Aliases)
+	}
+	if len(names) != want {
+		t.Fatalf("%d hostnames for %d enabled apps and their aliases (want %d)", len(names), len(c.Enabled()), want)
 	}
 	for _, n := range names {
 		if !strings.HasSuffix(n, ".example.org") {
@@ -335,4 +344,139 @@ func TestOnlyNamesThatSpeakHTTPAreProbed(t *testing.T) {
 		t.Errorf("WebHostnames dropped %d names, want exactly one (ssh): %v",
 			len(c.Hostnames())-len(c.WebHostnames()), c.WebHostnames())
 	}
+}
+
+// The operator asked for three names for the launcher: the apex, which Warpgate
+// publishes through rootServes, launcher.<domain>, and hub.<domain>.
+//
+// A second name is not a second app. It gets its own DNS record, its own
+// ingress rule and its own entry in Solisuite's host map — because appFor
+// resolves a Host header through that map, and without an entry hub would work
+// only by falling through to DefaultApp, which answers for every unknown host.
+// It does NOT get its own origin: an app has one place the launcher sends
+// people to.
+func TestAnAliasIsAnotherNameAndNotAnotherApp(t *testing.T) {
+	c := New("example.org", Default())
+
+	var warpNames []string
+	for _, w := range c.Warpgate() {
+		warpNames = append(warpNames, w.Name)
+	}
+	if !contains(warpNames, "hub") {
+		t.Errorf("hub gets no DNS record and no ingress rule: %v", warpNames)
+	}
+	for _, w := range c.Warpgate() {
+		if w.Name == "hub" && w.Upstream != solisuite {
+			t.Errorf("hub points at %q, not at the launcher's own upstream", w.Upstream)
+		}
+	}
+
+	var hubEntries, launcherEntries int
+	for _, a := range c.Solisuite() {
+		switch a.Host {
+		case "hub.example.org":
+			hubEntries++
+			if a.ID != "launcher" {
+				t.Errorf("hub.example.org maps to app %q, not the launcher", a.ID)
+			}
+			if a.Origin != "https://launcher.example.org" {
+				t.Errorf("hub's origin is %q; an app has one origin whichever name you arrive under", a.Origin)
+			}
+		case "launcher.example.org":
+			launcherEntries++
+		}
+	}
+	if hubEntries != 1 {
+		t.Errorf("hub has %d entries in Solisuite's host map; without exactly one it falls through to DefaultApp", hubEntries)
+	}
+	if launcherEntries != 1 {
+		t.Errorf("launcher.example.org has %d entries, want 1", launcherEntries)
+	}
+
+	// coreX advertises origins, not names. Two entries for one app would offer
+	// the launcher twice.
+	origins := c.CoreXOrigins(map[string]bool{"launcher": true})
+	if _, in := origins["hub"]; in {
+		t.Errorf("hub reached appOrigins: %v", origins)
+	}
+	if origins["launcher"] != "https://launcher.example.org" {
+		t.Errorf("appOrigins[launcher] = %q", origins["launcher"])
+	}
+
+	// And it has to be probed, or the wizard proves a name it published works
+	// without ever asking it.
+	if !contains(c.WebHostnames(), "hub.example.org") {
+		t.Errorf("hub is published and never probed: %v", c.WebHostnames())
+	}
+}
+
+// Two names for one thing is fine; one name for two things is not — whichever
+// entry Solisuite's host map took last would win and nothing would say which.
+func TestAnAliasThatCollidesWithAnAppIsRefused(t *testing.T) {
+	apps := Default()
+	for i := range apps {
+		if apps[i].ID == "launcher" {
+			apps[i].Aliases = []string{"mail"}
+		}
+	}
+	err := New("example.org", apps).Validate()
+	if err == nil {
+		t.Fatal("an alias that is already an app id was accepted")
+	}
+	// It must name BOTH claimants. The check used to run as the list was
+	// walked, so an alias colliding with an app further down slipped past and
+	// was caught later by the duplicate-id check, which reported "app \"mail\"
+	// appears twice" — the wrong one of the two, and a message that sends the
+	// reader to look at an entry that is fine.
+	for _, want := range []string{"mail", "launcher"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q as one of the two claimants: %v", want, err)
+		}
+	}
+}
+
+// The same, with the collision the other way round in the list, because that is
+// the order the old check happened to survive.
+func TestACollisionIsFoundWhicheverWayRound(t *testing.T) {
+	apps := Default()
+	for i := range apps {
+		if apps[i].ID == "system" {
+			apps[i].Aliases = []string{"launcher"}
+		}
+	}
+	err := New("example.org", apps).Validate()
+	if err == nil {
+		t.Fatal("an alias claiming an app named earlier in the list was accepted")
+	}
+	for _, want := range []string{"launcher", "system"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q: %v", want, err)
+		}
+	}
+}
+
+// And two apps reaching for the same alias.
+func TestTwoAppsCannotShareAnAlias(t *testing.T) {
+	apps := Default()
+	for i := range apps {
+		if apps[i].ID == "mail" || apps[i].ID == "files" {
+			apps[i].Aliases = []string{"inbox"}
+		}
+	}
+	err := New("example.org", apps).Validate()
+	if err == nil {
+		t.Fatal("two apps were allowed to claim one name")
+	}
+	if !strings.Contains(err.Error(), "inbox") {
+		t.Errorf("the refusal does not name the contested name: %v", err)
+	}
+}
+
+func contains(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }

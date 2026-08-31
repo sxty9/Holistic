@@ -430,6 +430,12 @@ func appsConflict(e *Engine, c catalogue.Catalogue, warp, soli, core *edit) *res
 	known := map[string]bool{}
 	for _, a := range catalogue.Default() {
 		known[a.ID] = true
+		// Aliases are names this instance publishes too. Without them the
+		// second run of this step reads its own `hub` entry as a stranger and
+		// holds a conflict against work it did itself.
+		for _, alias := range a.Aliases {
+			known[alias] = true
+		}
 	}
 	if arr, ok := warp.was("apps").([]any); ok {
 		var strangers []string
