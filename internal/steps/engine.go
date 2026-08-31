@@ -86,8 +86,13 @@ type given struct {
 	// records a decision nobody made.
 	sesRegion     string
 	sesRegionSaid bool
-	planOK        bool
-	sealOK        bool
+	// eventsTopic is the notification topic delivery failures are reported on,
+	// and eventsTopicSaid is whether anybody has said. Two fields for the same
+	// reason as the region above: empty is a real answer here.
+	eventsTopic     string
+	eventsTopicSaid bool
+	planOK          bool
+	sealOK          bool
 }
 
 // New builds the engine and reads the machine before it is asked anything.

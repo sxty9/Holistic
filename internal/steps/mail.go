@@ -569,3 +569,136 @@ func (e *Engine) sesRegion() string {
 	}
 	return strings.TrimSuffix(strings.TrimPrefix(host, prefix), suffix)
 }
+
+// Delivery reports — the return path for mail that this instance sent and the
+// receiving side refused.
+//
+// It is the half that was missing when this project began. Every component
+// reported success and the message reached no one, and there was no channel
+// through which anybody could have found out. A relay knows within seconds; the
+// question is only whether it has somewhere to say so.
+//
+// The endpoint is coreX's own, at /api/mail/events, and it is already reachable
+// from the public internet — Solisuite passes /api through — so this step
+// publishes no hostname and creates no DNS record. All it does is name the one
+// topic that endpoint will listen to. Left empty, the endpoint stays switched
+// off, which is the correct default: an endpoint accepting reports from any
+// topic is one anybody can use to declare an address unreachable.
+
+// topicARN is the shape of a notification topic's name. Checked for shape and
+// never for existence: this wizard has no credential at that provider and must
+// not pretend to have verified something it cannot see.
+var topicARN = regexp.MustCompile(`^arn:aws[a-z-]*:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+$`)
+
+func stepDeliveryReports() Step {
+	return Step{
+		ID:    "delivery-reports",
+		Title: "Hearing about mail that did not arrive",
+		Kind:  Local,
+		// corex-write, because this writes into the same file and coreX is
+		// restarted by both. role-mailboxes, because postmaster@ is where the
+		// notices come from and a notice from an address nothing answers is a
+		// message nobody can reply to.
+		After: []string{"corex-write", "role-mailboxes"},
+		desired: func(e *Engine) string {
+			return "write mail.eventsTopicArn into " + e.paths.CoreXConfig + " and restart " + e.paths.CoreXUnit +
+				", so the relay's reports about undeliverable mail are accepted from that one topic and no other"
+		},
+		need: func(e *Engine) *Need {
+			d := domainOr(e, "<domain>")
+			return &Need{
+				Kind:        "text",
+				Label:       "Which notification topic does the relay report delivery failures on?",
+				Placeholder: "arn:aws:sns:eu-central-1:123456789012:mail-events",
+				Value:       e.eventsTopic(),
+				Help: "In the SES console: create a configuration set, give it an event destination of type SNS, " +
+					"and select Bounce and Complaint. Subscribe that topic to https://" + d + "/api/mail/events " +
+					"as an HTTPS endpoint — the confirmation is answered automatically. Then turn Email Feedback " +
+					"Forwarding OFF on the identity, or every failure arrives twice: once as this report and once " +
+					"as a message from MAILER-DAEMON.\n\n" +
+					"Paste the topic's ARN here. It is checked exactly, so a report from any other topic is " +
+					"refused — without that, anybody who finds the endpoint can declare any address unreachable " +
+					"and mail to it simply stops.\n\n" +
+					"Leave this empty to skip it. Mail still sends; nothing tells you when it does not arrive.",
+			}
+		},
+		accept: acceptString(func(e *Engine, s string) error {
+			s = strings.TrimSpace(s)
+			if s != "" && !topicARN.MatchString(s) {
+				return fmt.Errorf("%w: %q is not a topic ARN — they look like "+
+					"arn:aws:sns:eu-central-1:123456789012:mail-events", ErrBadAnswer, s)
+			}
+			e.given.eventsTopic = s
+			e.given.eventsTopicSaid = true
+			return nil
+		}),
+		run: func(e *Engine) result {
+			topic := e.eventsTopic()
+			if topic == "" && !e.given.eventsTopicSaid && !e.ours("delivery-reports") {
+				return blocked("waiting to be told which topic carries delivery reports, or told to skip it")
+			}
+			ed, err := openEdit(e.paths.CoreXConfig, confMode)
+			if err != nil {
+				return failed(err.Error())
+			}
+			if had := atString(ed.tree, "mail.eventsTopicArn"); had != "" && had != topic && !e.ours("delivery-reports") {
+				return held(Conflict{
+					Object:      "mail.eventsTopicArn in " + e.paths.CoreXConfig,
+					Found:       quote(had),
+					FoundNote:   "this step has never run on this machine, so nothing here wrote it",
+					Desired:     quote(topic),
+					Summary:     "delivery reports are already accepted from " + had + ".",
+					Why:         "The endpoint accepts reports from exactly one topic. Repointing it stops the reports that are arriving today, and nothing announces that they stopped.",
+					Resolution:  "If this instance should listen to a different topic, clear mail.eventsTopicArn in " + e.paths.CoreXConfig + " deliberately, then run this step again.",
+					Consequence: "reports keep arriving from " + had + ". Nothing about sending changes.",
+				})
+			}
+			ed.set("mail.eventsTopicArn", topic)
+			changed := len(ed.changes()) > 0
+			if changed {
+				if err := applyAll([]*edit{ed}); err != nil {
+					return failed(err.Error())
+				}
+				if err := e.machine.Restart(e.paths.CoreXUnit); err != nil {
+					return failed(err.Error())
+				}
+			}
+			tree, _, err := readTree(e.paths.CoreXConfig)
+			if err != nil {
+				return failed(err.Error())
+			}
+			got := atString(tree, "mail.eventsTopicArn")
+			if got == "" {
+				return passed("delivery reports are off",
+					"mail.eventsTopicArn is empty in "+e.paths.CoreXConfig+", so /api/mail/events answers 503 "+
+						"to everything and no report is acted on.\n\n"+
+						"Mail still sends. What is missing is the only channel through which this instance can "+
+						"learn that a message it sent was refused — the failure this project began with was "+
+						"exactly that, and it went unnoticed for three days.")
+			}
+			// What is proven and what is not, said apart. The file says which
+			// topic will be listened to; whether anything ever posts to it is
+			// the provider's business and this wizard has no credential there.
+			return passed(got, fmt.Sprintf(
+				"read back from %s: mail.eventsTopicArn=%s. %s was restarted, so /api/mail/events now accepts "+
+					"reports carrying that topic and refuses every other.\n\n"+
+					"Not shown here: that the topic exists, that it is subscribed to this endpoint, or that "+
+					"Email Feedback Forwarding is off. Those are at the provider, this wizard has no credential "+
+					"there, and the first real bounce is what demonstrates them.",
+				e.paths.CoreXConfig, got, e.paths.CoreXUnit))
+		},
+	}
+}
+
+// eventsTopic is what was answered in this process, or what the file already
+// says.
+func (e *Engine) eventsTopic() string {
+	if e.given.eventsTopicSaid {
+		return e.given.eventsTopic
+	}
+	tree, _, err := readTree(e.paths.CoreXConfig)
+	if err != nil {
+		return ""
+	}
+	return atString(tree, "mail.eventsTopicArn")
+}

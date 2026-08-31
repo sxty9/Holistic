@@ -82,6 +82,7 @@ run unattended.
 | `mail-apply` | `foreign` | run warpgate again; publish the apex SPF record, `_dmarc`, and the envelope domain's two records |
 | `dmarc-published` | `theirs` | read `_dmarc` back from a public resolver that is not Cloudflare |
 | `mailfrom-visible` | `theirs` | read the envelope domain's MX and SPF back the same way, because that is how the provider checks them |
+| `delivery-reports` | `local` | name the one notification topic coreX accepts delivery failures from, or an answered decision to go without |
 | `seal` | `local` | record the instance as claimed, destroy the setup code, stop the LAN listener — one act |
 
 **The mail order is deliberate and reads backwards.** `role-mailboxes` comes

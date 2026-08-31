@@ -353,6 +353,11 @@ func (k *kit) drive() {
 	// tests that configure one say so themselves.
 	k.answer("mailfrom", "")
 	k.mustPass("mailfrom")
+	// Delivery reports are optional in the same way and for the same reason:
+	// the topic is created at the provider, and an instance can be finished
+	// without one.
+	k.answer("delivery-reports", "")
+	k.mustPass("delivery-reports")
 	// These talk to somebody else: mail-apply runs warpgate against a real
 	// zone, and the two read-backs ask a public resolver.
 	k.standIn("mail-apply", "dmarc-published", "mailfrom-visible")

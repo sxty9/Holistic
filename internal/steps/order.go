@@ -55,6 +55,7 @@ func definitions() []Step {
 		stepMailApply(),
 		stepDMARCPublished(),
 		stepMailFromVisible(),
+		stepDeliveryReports(),
 		stepSeal(),
 	}
 }

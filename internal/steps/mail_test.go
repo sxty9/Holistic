@@ -190,7 +190,12 @@ func TestCoreXWriteSetsTheMailDomain(t *testing.T) {
 // else's hand would have.
 func (k *kit) setInWarpgate(path string, v any) {
 	k.t.Helper()
-	tree, _, err := readTree(k.p.WarpgateConfig)
+	k.setInFile(k.p.WarpgateConfig, path, v)
+}
+
+func (k *kit) setInFile(file, path string, v any) {
+	k.t.Helper()
+	tree, _, err := readTree(file)
 	if err != nil {
 		k.t.Fatal(err)
 	}
@@ -212,7 +217,7 @@ func (k *kit) setInWarpgate(path string, v any) {
 	if err != nil {
 		k.t.Fatal(err)
 	}
-	if err := os.WriteFile(k.p.WarpgateConfig, b, 0o640); err != nil {
+	if err := os.WriteFile(file, b, 0o640); err != nil {
 		k.t.Fatal(err)
 	}
 }
@@ -399,4 +404,107 @@ func TestSomebodyElsesMXDoesNotCountAsTheEnvelopeDomain(t *testing.T) {
 	if row := k.run("mailfrom-visible"); row.Status == ledger.Passed {
 		t.Fatal("it accepted somebody else's mail host as the bounce host")
 	}
+}
+
+// The topic is what stands between a public endpoint and anybody being able to
+// declare an address unreachable, so it is checked for shape before it is
+// written and the refusal shows what one looks like.
+func TestATopicThatIsNotOneIsRefused(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+	for _, bad := range []string{"mail-events", "arn:aws:sns:eu-central-1:mail-events", "https://example.org/hook"} {
+		raw, err := json.Marshal(bad)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := k.e.Answer("delivery-reports", raw); err == nil {
+			t.Errorf("it accepted %q as a topic", bad)
+		}
+	}
+	good := "arn:aws:sns:eu-central-1:123456789012:mail-events"
+	raw, err := json.Marshal(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := k.e.Answer("delivery-reports", raw); err != nil {
+		t.Fatalf("it refused a real topic ARN: %v", err)
+	}
+	// Counted from here, not from the start of the run: corex-write restarts
+	// the same unit during drive(), so "a restart happened at some point" is
+	// satisfied by a restart this step did not do. The first version of this
+	// check passed with the restart deleted.
+	before := restarts(k, k.p.CoreXUnit)
+	k.mustPass("delivery-reports")
+	tree, _, err := readTree(k.p.CoreXConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atString(tree, "mail.eventsTopicArn"); got != good {
+		t.Errorf("mail.eventsTopicArn is %q", got)
+	}
+	// coreX reads this at start, so writing it without a restart is a setting
+	// that takes effect at the next power cut.
+	if restarts(k, k.p.CoreXUnit) == before {
+		t.Error("it wrote the topic and did not restart coreX")
+	}
+}
+
+func restarts(k *kit, unit string) int {
+	n := 0
+	for _, c := range k.m.calls {
+		if c == "restart "+unit {
+			n++
+		}
+	}
+	return n
+}
+
+// Going without is an answer, and the row says what is lost rather than
+// reporting a plain success.
+func TestNoDeliveryReportsSaysWhatIsLost(t *testing.T) {
+	k := newKit(t)
+	k.drive() // answers "" for delivery-reports
+	row := k.row("delivery-reports")
+	if row.Status != ledger.Passed {
+		t.Fatalf("delivery-reports: %s — %s", row.Status, row.Detail)
+	}
+	if !strings.Contains(row.Proof, "503") {
+		t.Errorf("the row does not say the endpoint is off: %q", row.Proof)
+	}
+	if !strings.Contains(row.Proof, "refused") {
+		t.Errorf("the row does not say what is no longer learnable: %q", row.Proof)
+	}
+}
+
+// A topic somebody else configured is not this wizard's to repoint: the
+// endpoint listens to exactly one, and moving it stops the reports arriving
+// today without announcing that they stopped.
+func TestDeliveryReportsWillNotRepointSomebodyElsesTopic(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+	if err := k.led.Mark("delivery-reports", ledger.Pending, "reset by the test"); err != nil {
+		t.Fatal(err)
+	}
+	theirs := "arn:aws:sns:eu-west-1:210987654321:their-events"
+	k.setInCoreX("mail.eventsTopicArn", theirs)
+
+	before := k.snapshot()
+	k.answer("delivery-reports", "arn:aws:sns:eu-central-1:123456789012:mail-events")
+	row := k.run("delivery-reports")
+	if row.Status != ledger.Conflict {
+		t.Fatalf("delivery-reports: %s — %s", row.Status, row.Detail)
+	}
+	if !strings.Contains(row.Conflict.Found, theirs) {
+		t.Errorf("the conflict does not quote what is there: %q", row.Conflict.Found)
+	}
+	if d := diffSnapshots(before, k.snapshot()); len(d) > 0 {
+		t.Errorf("it wrote anyway: %v", d)
+	}
+}
+
+// setInCoreX puts a value into coreX's configuration the way somebody else's
+// hand would have.
+func (k *kit) setInCoreX(path string, v any) {
+	k.t.Helper()
+	k.setInFile(k.p.CoreXConfig, path, v)
 }
