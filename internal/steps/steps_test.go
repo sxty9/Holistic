@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1822,5 +1823,70 @@ func TestAFailedPublishSaysWhy(t *testing.T) {
 	}
 	if !strings.Contains(row.Detail, "wrote /etc/warpgate/ingress.yml") {
 		t.Errorf("warpgate's own output was dropped, and it is where the detail is: %q", row.Detail)
+	}
+}
+
+// A name that does not resolve and a name that resolves and does not answer are
+// different problems with different fixes, and the probe reported both as one
+// line of Go error text.
+//
+// Seen on 2026-08-31: hub.henrysoase.org was live and answering 200 from the
+// public internet, and the probe failed because the router this machine asks
+// was still holding the NXDOMAIN it had cached before the record existed.
+// Reading that as "the hostname is broken" sends the operator to Cloudflare to
+// look at a record that is perfectly correct.
+func TestANameThatDoesNotResolveSaysSo(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.answer("apps", []appChoice{{ID: "gallery", On: true}})
+	k.mustPass("apps")
+	k.standIn("cert-wait")
+
+	missing := k.e.catalogue().Hostname("gallery")
+	k.respFor = func(url string) (Response, error) {
+		if strings.Contains(url, missing) {
+			return Response{}, &net.DNSError{Err: "no such host", Name: missing, IsNotFound: true}
+		}
+		return Response{Status: 200, Body: "<!doctype html>"}, nil
+	}
+	row := k.run("nonce-probe")
+	if row.Status == ledger.Passed {
+		t.Fatal("a hostname that does not resolve was accepted")
+	}
+	if !strings.Contains(row.Detail, "cannot resolve") {
+		t.Errorf("a name that does not resolve is not reported as one: %q", row.Detail)
+	}
+	if !strings.Contains(row.Detail, "dig") {
+		t.Errorf("the message does not say how to check whether it resolves elsewhere: %q", row.Detail)
+	}
+}
+
+// And a name that resolves but is not answered keeps its own words. Turning
+// every failure into a lecture about DNS would hide the one that is not.
+func TestAHostnameThatResolvesKeepsItsOwnError(t *testing.T) {
+	k := newKit(t)
+	k.answer("domain", testDomain)
+	k.mustPass("domain")
+	k.answer("apps", []appChoice{{ID: "gallery", On: true}})
+	k.mustPass("apps")
+	k.standIn("cert-wait")
+
+	dead := k.e.catalogue().Hostname("gallery")
+	k.respFor = func(url string) (Response, error) {
+		if strings.Contains(url, dead) {
+			return Response{}, errors.New("connection reset by peer")
+		}
+		return Response{Status: 200, Body: "<!doctype html>"}, nil
+	}
+	row := k.run("nonce-probe")
+	if row.Status == ledger.Passed {
+		t.Fatal("a hostname that could not be reached was accepted")
+	}
+	if !strings.Contains(row.Detail, "connection reset") {
+		t.Errorf("the actual error was replaced: %q", row.Detail)
+	}
+	if strings.Contains(row.Detail, "cannot resolve") {
+		t.Errorf("a reachable name was blamed on DNS: %q", row.Detail)
 	}
 }

@@ -1,7 +1,9 @@
 package steps
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"strconv"
 
 	"context"
@@ -507,6 +509,22 @@ func stepNonceProbe() Step {
 				nonce := fmt.Sprintf("%d-%d", e.now().UnixNano(), len(proof.String()))
 				res, err := e.fetch(context.Background(), "https://"+h+"/?holistic-probe="+nonce)
 				if err != nil {
+					// A name that does not resolve and a name that resolves and
+					// does not answer are different problems with different
+					// fixes, and this reported both as one line of Go error
+					// text. Seen on 2026-08-31: hub.henrysoase.org was live and
+					// answering 200 from the public internet, and the probe
+					// failed because the router this machine asks was still
+					// holding the NXDOMAIN it cached before the record existed.
+					// Reading that as "the hostname is broken" sends the
+					// operator to Cloudflare to look at a record that is
+					// perfectly correct.
+					if isDNSProblem(err) {
+						bad = append(bad, h+": this machine cannot resolve the name. If it resolves "+
+							"elsewhere (dig @1.1.1.1 "+h+"), the resolver here is holding an older "+
+							"answer and will forget it — Cloudflare caches a miss for 30 minutes")
+						continue
+					}
 					bad = append(bad, h+": "+err.Error())
 					continue
 				}
@@ -592,6 +610,22 @@ func firstConflictBlock(out string) string {
 // isTLSProblem separates "the certificate is not there yet" from "the host did
 // not answer at all". They look identical in a failed fetch and they are
 // different waits: one is on Cloudflare, the other is on this machine.
+// isDNSProblem answers whether the name could not be turned into an address at
+// all — as opposed to an address that was reached and said nothing useful.
+func isDNSProblem(err error) bool {
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	for _, m := range []string{"no such host", "name resolution", "server misbehaving"} {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
 func isTLSProblem(err error) bool {
 	s := strings.ToLower(err.Error())
 	for _, m := range []string{"certificate", "tls", "handshake", "x509"} {
