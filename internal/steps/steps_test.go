@@ -1796,3 +1796,31 @@ func writeClaimFile(t *testing.T, k *kit) {
 		t.Fatal(err)
 	}
 }
+
+// The one message whose whole job is to say why a publish stopped said
+// everything except that: "warpgate apply did not finish:" followed by
+// warpgate's plan and nothing else. The error was read from Run and thrown
+// away. Seen live on 2026-08-31, where a DNS record for hub.henrysoase.org did
+// not get published and the ledger gave no reason at all.
+func TestAFailedPublishSaysWhy(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+	k.standIn("tunnel-ensure")
+
+	bin := k.p.WarpgateBin
+	cfg := k.p.WarpgateConfig
+	k.m.out[bin+" -config "+cfg+" plan"] = "1 change(s). These touch public DNS."
+	k.m.out[bin+" -config "+cfg+" apply --yes"] = "wrote /etc/warpgate/ingress.yml"
+	k.m.fail["run "+bin+" -config "+cfg+" apply --yes"] = errors.New("signal: killed")
+
+	row := k.run("dns-apply")
+	if row.Status != ledger.Failed {
+		t.Fatalf("a publish that did not finish was reported as %s", row.Status)
+	}
+	if !strings.Contains(row.Detail, "signal: killed") {
+		t.Errorf("the failure does not say why it stopped: %q", row.Detail)
+	}
+	if !strings.Contains(row.Detail, "wrote /etc/warpgate/ingress.yml") {
+		t.Errorf("warpgate's own output was dropped, and it is where the detail is: %q", row.Detail)
+	}
+}

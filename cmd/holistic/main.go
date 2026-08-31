@@ -499,12 +499,32 @@ func reopenSetup(conf string, systemctl func(string, ...string) (string, error))
 // starting it here would be the reopen, which is a separate deliberate act with
 // its own confirmation.
 func mintInto(conf string, systemctl func(string, ...string) (string, error)) (string, bool, error) {
+	// Whether a claim was there BEFORE this one is minted, because that is what
+	// decides whether the running listener has a /claim route at all.
+	//
+	// A process that started with a claim registered the route and re-reads the
+	// file on every attempt, so it takes a fresh code without being touched. A
+	// process that started without one serves a single page saying there is no
+	// code and registers nothing, and only a restart can change that.
+	//
+	// Restarting unconditionally is what this used to do, and it cost a live
+	// run: `holistic code` was run while the wizard was midway through
+	// `warpgate apply`, the restart killed the process mid-command, and every
+	// answer the operator had given went with it — they are held in memory.
+	// Seen 2026-08-31 09:00:31.
+	_, hadClaim := os.Stat(filepath.Join(conf, "setup.claim"))
+	servesCode := hadClaim == nil
+
 	code, err := mintCode()
 	if err != nil {
 		return "", false, err
 	}
 	if err := writeClaim(conf, code); err != nil {
 		return "", false, err
+	}
+	if servesCode {
+		// Nothing to restart, and nothing lost.
+		return code, true, nil
 	}
 	if out, err := systemctl("systemctl", "try-restart", setupUnit); err != nil {
 		fmt.Fprintf(os.Stderr, "\n  warning: %s was not restarted, so it may still be holding the previous\n"+

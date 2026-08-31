@@ -363,7 +363,8 @@ func stepDNSApply() Step {
 			cfg := e.paths.WarpgateConfig
 			plan, err := e.machine.Run(bin, "-config", cfg, "plan")
 			if err != nil {
-				return failed("warpgate could not plan the edge:\n" + plan)
+				return failed(fmt.Sprintf("warpgate could not plan the edge: %v\n\nIts output was:\n%s",
+					err, strings.TrimSpace(plan)))
 			}
 			if strings.Contains(plan, "CONFLICT") {
 				return held(Conflict{
@@ -392,7 +393,13 @@ func stepDNSApply() Step {
 			}
 			out, err := e.machine.Run(bin, "-config", cfg, "apply", "--yes")
 			if err != nil {
-				return failed("warpgate apply did not finish:\n" + out)
+				// The error, not only the output. This reported "warpgate apply
+				// did not finish:" followed by warpgate's plan and nothing
+				// else — no exit status, no signal, no reason. The one message
+				// whose whole job is to say why a publish stopped said
+				// everything except that.
+				return failed(fmt.Sprintf("warpgate apply did not finish: %v\n\nIts output was:\n%s",
+					err, strings.TrimSpace(out)))
 			}
 			return passed("published", strings.TrimSpace(out))
 		},
