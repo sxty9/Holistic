@@ -981,8 +981,8 @@ func stepCoreXWrite() Step {
 				d = "the domain"
 			}
 			return fmt.Sprintf("check %s sets none of the COREX_ variables that would beat the file, then write "+
-				"instance.publicBaseUrl=https://%s, instance.cookieDomain=%s and auth.insecureCookies=false, and restart %s",
-				e.paths.CoreXEnv, d, d, e.paths.CoreXUnit)
+				"instance.publicBaseUrl=https://%s, instance.cookieDomain=%s, mail.domain=%s and auth.insecureCookies=false, and restart %s",
+				e.paths.CoreXEnv, d, d, d, e.paths.CoreXUnit)
 		},
 		run: runCoreXWrite,
 	}
@@ -1036,6 +1036,14 @@ func runCoreXWrite(e *Engine) result {
 	// http://holistic.local, so flipping this before a tunnel answers signs the
 	// operator out of the thing performing the installation.
 	ed.set("auth.insecureCookies", false)
+	// The mail domain, which nothing wrote before this line, and whose absence
+	// is silent in a way that matters: coreX reads mail.domain as "empty
+	// disables outbound", so an instance that followed this wizard to the end
+	// had a launcher, a tunnel and eight hostnames, and could not send or
+	// receive a message — with no step reporting anything. It is the same
+	// domain and not a second answer, which is why it is set here beside the
+	// other three rather than asked for again.
+	ed.set("mail.domain", c.Domain)
 
 	changed := len(ed.changes()) > 0
 	if changed {
@@ -1057,13 +1065,14 @@ func runCoreXWrite(e *Engine) result {
 		detail = c.Domain
 	}
 	return passed(detail, fmt.Sprintf(
-		"read back from %s: instance.publicBaseUrl=%s, instance.cookieDomain=%s, auth.insecureCookies=%v. "+
+		"read back from %s: instance.publicBaseUrl=%s, instance.cookieDomain=%s, auth.insecureCookies=%v, mail.domain=%s. "+
 			"%s sets none of the COREX_ variables that would override them, so what is in the file is what coreX will use. "+
 			"%s was restarted.",
 		e.paths.CoreXConfig,
 		atString(tree, "instance.publicBaseUrl"),
 		atString(tree, "instance.cookieDomain"),
 		at(tree, "auth.insecureCookies"),
+		atString(tree, "mail.domain"),
 		e.paths.CoreXEnv, e.paths.CoreXUnit))
 }
 

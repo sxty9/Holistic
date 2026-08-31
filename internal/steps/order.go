@@ -44,6 +44,15 @@ func definitions() []Step {
 		stepCertWait(),
 		stepNonceProbe(),
 		stepCoreXRestart2(),
+		// The mail half sits here, after the instance answers on its own
+		// domain and before setup closes. It is last because of what it
+		// consumes, not because it matters least: the role mailbox needs
+		// coreX to hold the domain, and the DMARC record must not name an
+		// address that does not yet accept mail.
+		stepRoleMailboxes(),
+		stepMailDNS(),
+		stepMailApply(),
+		stepDMARCPublished(),
 		stepSeal(),
 	}
 }

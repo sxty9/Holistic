@@ -343,6 +343,28 @@ func (k *kit) drive() {
 
 	k.standIn("nonce-probe")
 	k.mustPass("corex-restart-2")
+
+	k.mailboxesAnswer()
+	k.mustPass("role-mailboxes")
+	k.answer("mail-dns", "quarantine")
+	k.mustPass("mail-dns")
+	// Both talk to somebody else: mail-apply runs warpgate against a real
+	// zone, and dmarc-published asks a public resolver.
+	k.standIn("mail-apply", "dmarc-published")
+}
+
+// mailboxesAnswer makes corexctl behave the way it does on a machine where the
+// role mailboxes can be created: each create says nothing and exits 0, and the
+// listing afterwards shows all three. The listing is what the step reads —
+// three exit statuses are not the same fact as three mailboxes.
+func (k *kit) mailboxesAnswer() {
+	k.t.Helper()
+	var list strings.Builder
+	for _, r := range roleMailboxes() {
+		k.m.out[k.p.Corexctl+" mailbox create -address "+r.Local+" -name "+r.Name] = ""
+		fmt.Fprintf(&list, "%s@%s  %s\n", r.Local, testDomain, r.Name)
+	}
+	k.m.out[k.p.Corexctl+" mailbox list"] = list.String()
 }
 
 // snapshot is every configuration file, by content. The ledger is deliberately

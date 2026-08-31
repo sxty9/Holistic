@@ -354,58 +354,71 @@ func stepDNSApply() Step {
 		desired: fixed("create one proxied CNAME per app hostname, pointing at the tunnel — and refuse, per record, " +
 			"where something is already standing there"),
 		run: func(e *Engine) result {
-			// This step writes nothing. It runs warpgate, which is the only
-			// thing in this landscape that writes DNS — and which refuses to
-			// overwrite a record it did not create, marks what it does create,
-			// asks separately before deleting, and keeps a journal. Teaching a
-			// second thing to do all of that is how the two come to disagree,
-			// and the day they disagree is the day somebody's website is
-			// replaced by a launcher.
-			bin := e.paths.WarpgateBin
-			cfg := e.paths.WarpgateConfig
-			plan, err := e.machine.Run(bin, "-config", cfg, "plan")
-			if err != nil {
-				return failed(fmt.Sprintf("warpgate could not plan the edge: %v\n\nIts output was:\n%s",
-					err, strings.TrimSpace(plan)))
-			}
-			if strings.Contains(plan, "CONFLICT") {
-				return held(Conflict{
-					Object:    "the zone " + e.given.domain,
-					Found:     firstConflictBlock(plan),
-					FoundNote: "warpgate found records it did not create",
-					Desired:   "the hostnames this instance publishes",
-					Why: "Publishing over a record warpgate did not create would replace whatever is " +
-						"being served there today, and warpgate refuses rather than guessing which of you is right.",
-					Resolution:  "The block above names what is in the way and what to do about it. Then check again.",
-					Consequence: "the apps are not published yet. Everything already published keeps working.",
-				})
-			}
-			// A settled edge is something warpgate SAYS, not something absent
-			// from its output. Reading silence as "nothing to do" would turn a
-			// warpgate that printed nothing — the wrong binary, a truncated
-			// pipe, a version that changed its wording — into a successful
-			// publish that published nothing, reported as passed.
-			settled := strings.Contains(plan, "Nothing to do") || strings.Contains(plan, "0 change(s)")
-			hasWork := strings.Contains(plan, "change(s)") && !settled
-			switch {
-			case settled:
-				return passed("the edge already matches the configuration", strings.TrimSpace(plan))
-			case !hasWork:
-				return failed("warpgate did not say what it would change. Its output was:\n" + strings.TrimSpace(plan))
-			}
-			out, err := e.machine.Run(bin, "-config", cfg, "apply", "--yes")
-			if err != nil {
-				// The error, not only the output. This reported "warpgate apply
-				// did not finish:" followed by warpgate's plan and nothing
-				// else — no exit status, no signal, no reason. The one message
-				// whose whole job is to say why a publish stopped said
-				// everything except that.
-				return failed(fmt.Sprintf("warpgate apply did not finish: %v\n\nIts output was:\n%s",
-					err, strings.TrimSpace(out)))
-			}
-			return passed("published", strings.TrimSpace(out))
+			return runWarpgate(e, "the hostnames of "+e.given.domain)
 		},
 	}
+}
+
+// runWarpgate plans the edge, refuses on a conflict, and applies.
+//
+// This step writes nothing itself. It runs warpgate, which is the only thing in
+// this landscape that writes DNS — and which refuses to overwrite a record it
+// did not create, marks what it does create, asks separately before deleting,
+// and keeps a journal. Teaching a second thing to do all of that is how the two
+// come to disagree, and the day they disagree is the day somebody's website is
+// replaced by a launcher.
+//
+// It is shared by the two steps that publish — the app hostnames and the mail
+// records — for the same reason: a second copy of this logic is a second place
+// where the conflict path can be got wrong, and the copy that is got wrong is
+// the one that overwrites somebody's SPF.
+//
+// `what` names what is being published, and it is a parameter rather than a
+// sentence built in here because the failure message is the whole value of the
+// step when it fails.
+func runWarpgate(e *Engine, what string) result {
+	bin := e.paths.WarpgateBin
+	cfg := e.paths.WarpgateConfig
+	plan, err := e.machine.Run(bin, "-config", cfg, "plan")
+	if err != nil {
+		return failed(fmt.Sprintf("warpgate could not plan %s: %v\n\nIts output was:\n%s",
+			what, err, strings.TrimSpace(plan)))
+	}
+	if strings.Contains(plan, "CONFLICT") {
+		return held(Conflict{
+			Object:    "the zone " + e.given.domain,
+			Found:     firstConflictBlock(plan),
+			FoundNote: "warpgate found records it did not create",
+			Desired:   what,
+			Why: "Publishing over a record warpgate did not create would replace whatever is " +
+				"being served there today, and warpgate refuses rather than guessing which of you is right.",
+			Resolution:  "The block above names what is in the way and what to do about it. Then check again.",
+			Consequence: "nothing was published. Everything already published keeps working.",
+		})
+	}
+	// A settled edge is something warpgate SAYS, not something absent from its
+	// output. Reading silence as "nothing to do" would turn a warpgate that
+	// printed nothing — the wrong binary, a truncated pipe, a version that
+	// changed its wording — into a successful publish that published nothing,
+	// reported as passed.
+	settled := strings.Contains(plan, "Nothing to do") || strings.Contains(plan, "0 change(s)")
+	hasWork := strings.Contains(plan, "change(s)") && !settled
+	switch {
+	case settled:
+		return passed("the edge already matches the configuration", strings.TrimSpace(plan))
+	case !hasWork:
+		return failed("warpgate did not say what it would change. Its output was:\n" + strings.TrimSpace(plan))
+	}
+	out, err := e.machine.Run(bin, "-config", cfg, "apply", "--yes")
+	if err != nil {
+		// The error, not only the output. This reported "warpgate apply did not
+		// finish:" followed by warpgate's plan and nothing else — no exit
+		// status, no signal, no reason. The one message whose whole job is to
+		// say why a publish stopped said everything except that.
+		return failed(fmt.Sprintf("warpgate apply did not finish: %v\n\nIts output was:\n%s",
+			err, strings.TrimSpace(out)))
+	}
+	return passed("published", strings.TrimSpace(out))
 }
 
 func stepConnectorRegistered() Step {

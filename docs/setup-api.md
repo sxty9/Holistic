@@ -62,6 +62,7 @@ run unattended.
 | `apps` | `local` | which apps are on. **One answer, three outputs.** |
 | `token-verify` | `foreign` | verify the Cloudflare token **before it lands anywhere** |
 | `zone-resolve` | `foreign` | resolve the zone; require `status == active`; keep the account id |
+| `nameservers` | `theirs` | only when the zone is `pending`: the registrar has no API, so this is where the wizard stops and waits rather than pretending |
 | `token-store` | `local` | write it to Warpgate's own path, `0600 root:root` |
 | `zone-inventory` | `foreign` | read the zone before changing it; the export goes in the ledger |
 | `tunnel-ensure` | `foreign` | the first irreversible creation at a provider |
@@ -71,14 +72,22 @@ run unattended.
 | `ingress-write` | `local` | write the ingress, start **and enable** the connector |
 | `connector-registered` | `theirs` | wait for `Registered tunnel connection` — not for "unit active" |
 | `solisuite-write` | `local` | write and restart |
-| `corex-write` | `local` | write and restart; `insecureCookies` → `false` |
+| `corex-write` | `local` | write and restart; `insecureCookies` → `false`; `mail.domain`, without which mail is off and nothing says so |
 | `cert-wait` | `theirs` | Cloudflare's universal certificate, on their clock |
 | `nonce-probe` | `theirs` | per hostname, from the public internet; then `appOrigins` for that host |
 | `corex-restart-2` | `local` | restart again; check the apex while logged out |
+| `role-mailboxes` | `local` | create `dmarc@`, `postmaster@` and `abuse@` through `corexctl`. They receive and never send. |
+| `mail-dns` | `local` | write Warpgate's `mail` block: SPF mechanism, DMARC policy, report address |
+| `mail-apply` | `foreign` | run warpgate again; publish the apex SPF record and `_dmarc` |
+| `dmarc-published` | `theirs` | read `_dmarc` back from a public resolver that is not Cloudflare |
+| `seal` | `local` | record the instance as claimed, destroy the setup code, stop the LAN listener — one act |
 
-`nameservers` sits between `zone-resolve` and the rest when the zone is
-`pending`: the registrar has no API, so it is `theirs` and it is where the
-wizard stops and waits rather than pretending.
+**The mail order is deliberate and reads backwards.** `role-mailboxes` comes
+before `mail-apply` because a DMARC record carries
+`rua=mailto:dmarc@<domain>`, which asks every receiver on the internet to send
+its aggregate reports there. Published before the address accepts mail, the
+reports are refused for as long as nobody looks — and nobody looks, because the
+record is there and the step said passed.
 
 **Every step ends in a real observation.** An API returning 200 is a fast
 pre-check that buys a better error message. It is never the proof. That is the

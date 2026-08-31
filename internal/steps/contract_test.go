@@ -153,3 +153,43 @@ func sorted(m map[string]bool) []string {
 	sort.Strings(out)
 	return out
 }
+
+// TestEveryStepIsInTheContract reads docs/setup-api.md as text and requires a
+// row for every step, in the order the engine runs them.
+//
+// The document is the contract both sides were written against — the engine on
+// one, the pages on the other — so a step that exists only in Go is a step the
+// document's readers do not know about. That is not a documentation
+// preference: corex-write silently stopped setting the mail domain for as long
+// as nobody compared the two, and the table is where somebody would have looked.
+//
+// Order as well as presence. A table that lists the same steps in a different
+// sequence describes a different wizard, and the mail steps in particular are
+// ordered by what they consume rather than by importance.
+func TestEveryStepIsInTheContract(t *testing.T) {
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "setup-api.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(doc)
+	at := -1
+	for _, st := range definitions() {
+		row := "| `" + st.ID + "` | `" + string(st.Kind) + "` |"
+		i := strings.Index(text, row)
+		if i < 0 {
+			// Named separately, because the two are different defects with
+			// different fixes: a missing row, and a row whose kind is wrong.
+			if strings.Contains(text, "| `"+st.ID+"` |") {
+				t.Errorf("docs/setup-api.md lists %s with a different kind than the engine's %q",
+					st.ID, st.Kind)
+				continue
+			}
+			t.Errorf("docs/setup-api.md has no row for the step %s", st.ID)
+			continue
+		}
+		if i < at {
+			t.Errorf("docs/setup-api.md lists %s before a step the engine runs earlier", st.ID)
+		}
+		at = i
+	}
+}

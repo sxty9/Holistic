@@ -74,8 +74,13 @@ type given struct {
 	// written only for a proven app. The probe passed on ten hostnames and
 	// appOrigins stayed {}, which is a launcher offering nothing.
 	proven map[string]bool
-	planOK bool
-	sealOK bool
+	// dmarcPolicy is what receivers are asked to do with mail from this
+	// domain that cannot be shown to be ours. It is here rather than read
+	// from the file on every use because it is answered before it is
+	// written, and the step that writes it needs to know what was said.
+	dmarcPolicy string
+	planOK      bool
+	sealOK      bool
 }
 
 // New builds the engine and reads the machine before it is asked anything.
