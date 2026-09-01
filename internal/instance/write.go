@@ -305,4 +305,11 @@ var SolisuiteOverrides = map[string]string{
 	"SOLISUITE_APP_HOST_*": "apps[].host",
 	"SOLISUITE_COREX_URL":  "corexUrl",
 	"SOLISUITE_LISTEN":     "listen",
+	// The one that was missing, found on 2026-09-01. A line reading
+	// SOLISUITE_WEB_ROOT=/opt/solisuite/web sat in the environment file from
+	// an install in August. The wizard wrote webRoot into the JSON, read it
+	// back, reported the new directory — and Solisuite went on serving a front
+	// end from three weeks earlier, because the environment is applied after
+	// the file. Every check agreed and a message would not open.
+	"SOLISUITE_WEB_ROOT": "webRoot",
 }

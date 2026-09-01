@@ -556,3 +556,28 @@ func TestSolisuiteWillNotSilentlyRepointSomebodyElsesWebRoot(t *testing.T) {
 		t.Errorf("it wrote anyway: webRoot is now %q", got)
 	}
 }
+
+// The environment beats the file, and the wizard has to say so rather than
+// write a value nothing reads.
+//
+// SOLISUITE_WEB_ROOT was the one variable missing from the watched list. A line
+// left over from an August install pointed Solisuite at a front end three weeks
+// older than the API it calls; the wizard wrote webRoot into the JSON, read it
+// back, reported the new directory, and Solisuite went on serving the old one.
+func TestAnEnvironmentWebRootIsAConflictNotAWrite(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+	if err := k.led.Mark("solisuite-write", ledger.Pending, "reset by the test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(k.p.SolisuiteEnv, []byte("SOLISUITE_WEB_ROOT=/opt/solisuite/web\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	row := k.run("solisuite-write")
+	if row.Status != ledger.Conflict {
+		t.Fatalf("solisuite-write: %s — %s", row.Status, row.Detail)
+	}
+	if !strings.Contains(row.Conflict.Found, "SOLISUITE_WEB_ROOT") {
+		t.Errorf("the conflict does not name the variable: %q", row.Conflict.Found)
+	}
+}
