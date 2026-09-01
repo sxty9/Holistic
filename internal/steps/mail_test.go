@@ -508,3 +508,51 @@ func (k *kit) setInCoreX(path string, v any) {
 	k.t.Helper()
 	k.setInFile(k.p.CoreXConfig, path, v)
 }
+
+// Solisuite's apps and the API they call ship as one release, so the directory
+// they are served from is pinned to the one the installer writes.
+//
+// It was not, and the way that presented was a blank page: a front end built on
+// 13 August served against coreX v0.2.6, with no error anywhere. Not a mail
+// defect, which is why it took a person clicking a message to find it.
+func TestSolisuiteServesTheFrontEndTheInstallerWrites(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+	tree, _, err := readTree(k.p.SolisuiteConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atString(tree, "webRoot"); got != k.p.SolisuiteWeb {
+		t.Errorf("webRoot is %q, not the directory the installer writes (%q)", got, k.p.SolisuiteWeb)
+	}
+	if row := k.row("solisuite-write"); !strings.Contains(row.Proof, k.p.SolisuiteWeb) {
+		t.Errorf("the proof does not say where the apps are served from: %q", row.Proof)
+	}
+}
+
+// A directory somebody chose deliberately is not this wizard's to repoint
+// without saying so.
+func TestSolisuiteWillNotSilentlyRepointSomebodyElsesWebRoot(t *testing.T) {
+	k := newKit(t)
+	k.drive()
+	if err := k.led.Mark("solisuite-write", ledger.Pending, "reset by the test"); err != nil {
+		t.Fatal(err)
+	}
+	theirs := "/srv/our-own-build"
+	k.setInFile(k.p.SolisuiteConfig, "webRoot", theirs)
+
+	row := k.run("solisuite-write")
+	if row.Status != ledger.Conflict {
+		t.Fatalf("solisuite-write: %s — %s", row.Status, row.Detail)
+	}
+	if !strings.Contains(row.Conflict.Found, theirs) {
+		t.Errorf("the conflict does not quote what is there: %q", row.Conflict.Found)
+	}
+	tree, _, err := readTree(k.p.SolisuiteConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := atString(tree, "webRoot"); got != theirs {
+		t.Errorf("it wrote anyway: webRoot is now %q", got)
+	}
+}

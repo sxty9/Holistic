@@ -934,6 +934,23 @@ func stepSolisuiteWrite() Step {
 				return failed(err.Error())
 			}
 			ed.set("apps", c.Solisuite())
+			// Pinned, and this is the one that had gone wrong. webRoot pointed
+			// at a directory the installer never writes, so the apps were
+			// served from a build three weeks older than the API they call.
+			// Nothing failed; a message simply would not open.
+			if had := atString(ed.tree, "webRoot"); had != "" && had != e.paths.SolisuiteWeb && !e.ours("solisuite-write") {
+				return held(Conflict{
+					Object:      "webRoot in " + e.paths.SolisuiteConfig,
+					Found:       quote(had),
+					FoundNote:   "this step has never run on this machine, so nothing here pinned it",
+					Desired:     quote(e.paths.SolisuiteWeb),
+					Summary:     "Solisuite is serving its apps from " + had + ".",
+					Why:         "The apps and the API they call ship as one release. Serving them from a directory no upgrade writes to lets the two drift apart, and the way that presents is a blank page rather than an error.",
+					Resolution:  "If that directory is deliberate, leave it and skip this step. Otherwise clear webRoot in " + e.paths.SolisuiteConfig + " and run this step again.",
+					Consequence: "Solisuite keeps serving what is in " + had + ".",
+				})
+			}
+			ed.set("webRoot", e.paths.SolisuiteWeb)
 			changed := len(ed.changes()) > 0
 			if changed {
 				if err := applyAll([]*edit{ed}); err != nil {
@@ -963,8 +980,11 @@ func stepSolisuiteWrite() Step {
 			}
 			return passed(detail, fmt.Sprintf(
 				"%s lists %d apps, %d of them carrying both host and origin, and nothing in %s overrides them. "+
-					"%s is active. appFor() has a map to work from rather than falling back to defaultApp.",
-				e.paths.SolisuiteConfig, len(apps), withHost, e.paths.SolisuiteEnv, e.paths.SolisuiteUnit))
+					"webRoot is %s, which is the directory the installer writes, so the apps and the API "+
+					"they call come from one release. %s is active. appFor() has a map to work from rather "+
+					"than falling back to defaultApp.",
+				e.paths.SolisuiteConfig, len(apps), withHost, e.paths.SolisuiteEnv,
+				quote(at(tree, "webRoot")), e.paths.SolisuiteUnit))
 		},
 	}
 }

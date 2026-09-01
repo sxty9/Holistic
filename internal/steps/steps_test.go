@@ -198,6 +198,7 @@ func newKit(t *testing.T) *kit {
 		CoreXUnit:       "corex-api.test",
 		SolisuiteUnit:   "solisuite.test",
 		ConnectorUnit:   "warpgate.test",
+		SolisuiteWeb:    filepath.Join(d, "opt", "web"),
 		WarpgateBin:     "warpgate-that-is-recorded-not-run",
 		Seal:            filepath.Join(etc, "holistic", "claimed"),
 		Claim:           filepath.Join(etc, "holistic", "setup.claim"),

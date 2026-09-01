@@ -33,6 +33,15 @@ type Paths struct {
 	// log line.
 	WarpgateToken string
 
+	// SolisuiteWeb is the directory Solisuite serves its apps from. It is
+	// pinned rather than left to whatever a previous install wrote, for the
+	// same reason Warpgate's configPath is: a front end read from a directory
+	// no upgrade writes to is a front end that silently ages away from the API
+	// it talks to, and the way that presents is a blank page rather than an
+	// error anybody can act on. Measured on 2026-09-01: a build from 13 August
+	// being served against coreX v0.2.6.
+	SolisuiteWeb string
+
 	// WarpgateBin is the command that plans and applies the edge. The wizard
 	// never writes DNS itself — see cloudflare.go — so this is how every
 	// provider write happens.
@@ -80,6 +89,7 @@ func DefaultPaths() Paths {
 		// was wrong. Checked against the running machine on 2026-08-30.
 		WarpgateIngress: "/etc/warpgate/ingress.yml",
 		WarpgateToken:   "/etc/warpgate/cloudflare.token",
+		SolisuiteWeb:    "/opt/holistic/web",
 		WarpgateBin:     "/opt/holistic/bin/warpgate",
 		CoreXUnit:       "corex-api.service",
 		SolisuiteUnit:   "solisuite.service",

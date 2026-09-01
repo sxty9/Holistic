@@ -591,6 +591,20 @@ install_release() {
 		note "$PREFIX/setup-web"
 	fi
 
+	# Solisuite's front end. The release has always carried it and nothing
+	# ever installed it, so /opt/holistic/web did not exist and the apps were
+	# served from wherever a much older install had left them — on this
+	# machine, a build from 13 August against an API that had moved on. A
+	# front end and the API it talks to are one release or they are two
+	# programs disagreeing about a JSON shape, and the way that presents is a
+	# blank page.
+	if [ -d "$src/web" ]; then
+		rm -rf "$PREFIX/web"
+		install -d -m 0755 "$PREFIX/web"
+		cp -a "$src/web/." "$PREFIX/web/"
+		note "$PREFIX/web"
+	fi
+
 	local f
 	for f in "$src/bin/"*; do
 		[ -f "$f" ] || continue
