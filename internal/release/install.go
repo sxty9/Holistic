@@ -266,3 +266,72 @@ func StrayMessage(strays []Stray, binDir, version string) string {
 		"    sudo systemctl daemon-reload\n", binDir)
 	return b.String()
 }
+
+// SwapAssets replaces a directory of static files with the release's copy.
+//
+// It exists because upgrade replaced binaries and nothing else, while install
+// laid down the web directories — so an instance that was upgraded rather than
+// reinstalled kept whatever front end it had when it was first installed. That
+// is the same defect as the units running binaries from elsewhere, one layer
+// up: the release said one thing, the machine served another, and nothing
+// reported a difference.
+//
+// The old directory is moved aside and only removed once the new one is in
+// place, so a failure halfway leaves the previous front end serving rather than
+// an empty directory.
+func SwapAssets(rel *Release, dest, name string) (bool, error) {
+	src := filepath.Join(rel.Dir, "holistic", name)
+	if fi, err := os.Stat(src); err != nil || !fi.IsDir() {
+		// A release that predates this directory simply does not carry it.
+		// Leaving what is there is right; removing it would break an instance
+		// that is downgrading.
+		return false, nil
+	}
+	staged := dest + ".incoming"
+	if err := os.RemoveAll(staged); err != nil {
+		return false, err
+	}
+	if err := copyTree(src, staged); err != nil {
+		return false, err
+	}
+	previous := dest + ".previous"
+	_ = os.RemoveAll(previous)
+	if _, err := os.Stat(dest); err == nil {
+		if err := os.Rename(dest, previous); err != nil {
+			return false, err
+		}
+	}
+	if err := os.Rename(staged, dest); err != nil {
+		// Put the old one back rather than leave nothing being served.
+		_ = os.Rename(previous, dest)
+		return false, err
+	}
+	_ = os.RemoveAll(previous)
+	return true, nil
+}
+
+func copyTree(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if !info.Mode().IsRegular() {
+			// Not copied, and not silently skipped either: a symlink or a
+			// device node in a release archive is something nobody intended.
+			return fmt.Errorf("%s is not a regular file", path)
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, b, 0o644)
+	})
+}

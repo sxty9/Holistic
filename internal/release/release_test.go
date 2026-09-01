@@ -377,3 +377,85 @@ func stubUnits(active map[string]bool, execs map[string]string) func() {
 	isActive = func(u string) bool { return active[u] }
 	return func() { unitExec, isActive = oldExec, oldActive }
 }
+
+// Upgrade replaced binaries and left the static files, so an instance that was
+// upgraded rather than reinstalled served the front end it had on the day it
+// was installed. Same defect as a unit running a binary from elsewhere, one
+// layer up.
+func TestSwapAssetsReplacesTheWholeDirectory(t *testing.T) {
+	dir := t.TempDir()
+	relDir := filepath.Join(dir, "rel")
+	if err := os.MkdirAll(filepath.Join(relDir, "holistic", "web", "assets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(p, s string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(relDir, "holistic", "web", "index.html"), "new")
+	write(filepath.Join(relDir, "holistic", "web", "assets", "app-new.js"), "new js")
+
+	dest := filepath.Join(dir, "opt", "web")
+	write(filepath.Join(dest, "index.html"), "old")
+	write(filepath.Join(dest, "assets", "app-old.js"), "old js")
+
+	swapped, err := SwapAssets(&Release{Dir: relDir}, dest, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !swapped {
+		t.Fatal("it reported that nothing was replaced")
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "index.html"))
+	if err != nil || string(got) != "new" {
+		t.Errorf("index.html is %q (%v)", got, err)
+	}
+	// The whole directory, not a merge. A hashed asset left behind from an
+	// older build is a file nothing references and a mystery to whoever finds
+	// it next; worse, an index that still points at one is a page that half
+	// loads.
+	if _, err := os.Stat(filepath.Join(dest, "assets", "app-old.js")); err == nil {
+		t.Error("a file from the previous build survived the replacement")
+	}
+	if _, err := os.Stat(filepath.Join(dest, "assets", "app-new.js")); err != nil {
+		t.Errorf("the new build's asset is not there: %v", err)
+	}
+	// Nothing is left lying beside it.
+	for _, leftover := range []string{dest + ".incoming", dest + ".previous"} {
+		if _, err := os.Stat(leftover); err == nil {
+			t.Errorf("%s was left behind", leftover)
+		}
+	}
+}
+
+// A release that does not carry the directory leaves what is there. Removing
+// it would empty the front end of an instance that is downgrading.
+func TestSwapAssetsLeavesWhatAReleaseDoesNotCarry(t *testing.T) {
+	dir := t.TempDir()
+	relDir := filepath.Join(dir, "rel")
+	if err := os.MkdirAll(filepath.Join(relDir, "holistic"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "opt", "web")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "index.html"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	swapped, err := SwapAssets(&Release{Dir: relDir}, dest, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if swapped {
+		t.Error("it reported replacing a directory the release does not carry")
+	}
+	if got, _ := os.ReadFile(filepath.Join(dest, "index.html")); string(got) != "old" {
+		t.Errorf("it changed what was there: %q", got)
+	}
+}

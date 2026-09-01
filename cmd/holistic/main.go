@@ -308,6 +308,18 @@ func cmdUpgrade(args []string) error {
 		return serr
 	}
 
+	// The static files, which upgrade did not touch until 2026-09-01. Before
+	// the restart, so a service comes up against the front end it ships with.
+	for _, name := range []string{"web", "setup-web"} {
+		swapped, aerr := release.SwapAssets(rel, filepath.Join(*prefix, name), name)
+		if aerr != nil {
+			return fmt.Errorf("%s could not be replaced: %w", filepath.Join(*prefix, name), aerr)
+		}
+		if swapped {
+			fmt.Printf("   %s\n", filepath.Join(*prefix, name))
+		}
+	}
+
 	fmt.Println("\n== Restarting what is running")
 	restarted, err := release.RestartUnits(managedUnits)
 	if err != nil {
